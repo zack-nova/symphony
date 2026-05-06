@@ -50,6 +50,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:options, :map, default: %{})
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -59,7 +60,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :options, :active_states, :terminal_states],
         empty_values: []
       )
     end
@@ -366,11 +367,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_settings(settings) do
-    tracker = %{
-      settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
-    }
+    tracker = finalize_tracker(settings.tracker)
 
     workspace = %{
       settings.workspace
@@ -385,6 +382,50 @@ defmodule SymphonyElixir.Config.Schema do
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
   end
+
+  defp finalize_tracker(tracker) do
+    tracker = %{
+      tracker
+      | api_key: resolve_secret_setting(tracker.api_key, System.get_env("LINEAR_API_KEY")),
+        assignee: resolve_secret_setting(tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+    }
+
+    options = tracker_options(tracker)
+
+    %{
+      tracker
+      | endpoint: Map.get(options, "endpoint", tracker.endpoint),
+        api_key: Map.get(options, "api_key", tracker.api_key),
+        project_slug: Map.get(options, "project_slug", tracker.project_slug),
+        assignee: Map.get(options, "assignee", tracker.assignee),
+        options: options
+    }
+  end
+
+  defp tracker_options(tracker) do
+    tracker
+    |> legacy_tracker_options()
+    |> Map.merge(resolve_tracker_options(tracker.options || %{}))
+  end
+
+  defp legacy_tracker_options(tracker) do
+    %{}
+    |> put_option(:endpoint, tracker.endpoint)
+    |> put_option(:api_key, tracker.api_key)
+    |> put_option(:project_slug, tracker.project_slug)
+    |> put_option(:assignee, tracker.assignee)
+  end
+
+  defp resolve_tracker_options(options) when is_map(options) do
+    options
+    |> normalize_keys()
+    |> Map.update("api_key", nil, &resolve_secret_setting(&1, System.get_env("LINEAR_API_KEY")))
+    |> Map.update("assignee", nil, &resolve_secret_setting(&1, System.get_env("LINEAR_ASSIGNEE")))
+    |> drop_nil_values()
+  end
+
+  defp put_option(options, _key, nil), do: options
+  defp put_option(options, key, value), do: Map.put(options, to_string(key), value)
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

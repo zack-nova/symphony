@@ -89,7 +89,8 @@ Minimal example:
 ---
 tracker:
   kind: linear
-  project_slug: "..."
+  options:
+    project_slug: "..."
 workspace:
   root: ~/code/workspaces
 hooks:
@@ -102,7 +103,7 @@ codex:
   command: codex app-server
 ---
 
-You are working on a Linear issue {{ issue.identifier }}.
+You are working on a tracker issue {{ issue.identifier }}.
 
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
@@ -127,7 +128,11 @@ Notes:
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
-- `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- Adapter-specific settings live under `tracker.options`. The legacy Linear fields
+  `tracker.endpoint`, `tracker.api_key`, `tracker.project_slug`, and `tracker.assignee` are still
+  accepted and are normalized into `tracker.options`.
+- `tracker.options.api_key` reads from `LINEAR_API_KEY` when unset or when value is
+  `$LINEAR_API_KEY`.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -135,7 +140,8 @@ Notes:
 
 ```yaml
 tracker:
-  api_key: $LINEAR_API_KEY
+  options:
+    api_key: $LINEAR_API_KEY
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:

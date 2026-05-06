@@ -917,6 +917,80 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.command == "#{codex_bin} app-server"
   end
 
+  test "config exposes adapter-specific tracker options while preserving legacy linear fields" do
+    api_key_env_var = "SYMP_LINEAR_OPTIONS_KEY_#{System.unique_integer([:positive])}"
+    assignee_env_var = "SYMP_LINEAR_OPTIONS_ASSIGNEE_#{System.unique_integer([:positive])}"
+
+    previous_api_key = System.get_env(api_key_env_var)
+    previous_assignee = System.get_env(assignee_env_var)
+
+    System.put_env(api_key_env_var, "resolved-linear-token")
+    System.put_env(assignee_env_var, "resolved-assignee")
+
+    on_exit(fn ->
+      restore_env(api_key_env_var, previous_api_key)
+      restore_env(assignee_env_var, previous_assignee)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_endpoint: "https://linear.example/graphql",
+      tracker_api_token: "$#{api_key_env_var}",
+      tracker_project_slug: "project-slug",
+      tracker_assignee: "$#{assignee_env_var}"
+    )
+
+    config = Config.settings!()
+
+    assert config.tracker.endpoint == "https://linear.example/graphql"
+    assert config.tracker.api_key == "resolved-linear-token"
+    assert config.tracker.project_slug == "project-slug"
+    assert config.tracker.assignee == "resolved-assignee"
+
+    assert config.tracker.options == %{
+             "endpoint" => "https://linear.example/graphql",
+             "api_key" => "resolved-linear-token",
+             "project_slug" => "project-slug",
+             "assignee" => "resolved-assignee"
+           }
+
+    assert :ok = Config.validate!()
+  end
+
+  test "linear tracker can be configured through tracker options without legacy fields" do
+    workflow = """
+    ---
+    tracker:
+      kind: linear
+      active_states: ["Todo"]
+      terminal_states: ["Done"]
+      options:
+        endpoint: "https://linear.example/graphql"
+        api_key: "options-linear-token"
+        project_slug: "options-project"
+        assignee: "options-assignee"
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    config = Config.settings!()
+
+    assert config.tracker.options == %{
+             "endpoint" => "https://linear.example/graphql",
+             "api_key" => "options-linear-token",
+             "project_slug" => "options-project",
+             "assignee" => "options-assignee"
+           }
+
+    assert config.tracker.endpoint == "https://linear.example/graphql"
+    assert config.tracker.api_key == "options-linear-token"
+    assert config.tracker.project_slug == "options-project"
+    assert config.tracker.assignee == "options-assignee"
+    assert :ok = Config.validate!()
+  end
+
   test "config no longer resolves legacy env: references" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

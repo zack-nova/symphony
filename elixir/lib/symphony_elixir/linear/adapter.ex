@@ -37,6 +37,30 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @spec capabilities() :: map()
+  def capabilities do
+    %{
+      comments: true,
+      state_updates: true,
+      issue_sections: false,
+      review_artifacts: false
+    }
+  end
+
+  @spec validate_settings(term()) :: :ok | {:error, term()}
+  def validate_settings(settings) do
+    cond do
+      not is_binary(settings.api_key) ->
+        {:error, :missing_linear_api_token}
+
+      not is_binary(settings.project_slug) ->
+        {:error, :missing_linear_project_slug}
+
+      true ->
+        :ok
+    end
+  end
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 

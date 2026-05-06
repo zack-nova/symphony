@@ -4,7 +4,8 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.Tracker.Issue
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -105,7 +106,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
-    tracker = Config.settings!().tracker
+    tracker = Tracker.settings()
     project_slug = tracker.project_slug
 
     cond do
@@ -129,7 +130,7 @@ defmodule SymphonyElixir.Linear.Client do
     if normalized_states == [] do
       {:ok, []}
     else
-      tracker = Config.settings!().tracker
+      tracker = Tracker.settings()
       project_slug = tracker.project_slug
 
       cond do
@@ -381,7 +382,7 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp graphql_headers do
-    case Config.settings!().tracker.api_key do
+    case Tracker.settings().api_key do
       nil ->
         {:error, :missing_linear_api_token}
 
@@ -395,7 +396,7 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp post_graphql_request(payload, headers) do
-    Req.post(Config.settings!().tracker.endpoint,
+    Req.post(Tracker.settings().endpoint,
       headers: headers,
       json: payload,
       connect_options: [timeout: 30_000]
@@ -488,7 +489,7 @@ defmodule SymphonyElixir.Linear.Client do
   defp assignee_id(%{} = assignee), do: normalize_assignee_match_value(assignee["id"])
 
   defp routing_assignee_filter do
-    case Config.settings!().tracker.assignee do
+    case Tracker.settings().assignee do
       nil ->
         {:ok, nil}
 

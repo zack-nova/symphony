@@ -350,14 +350,20 @@ Fields:
 - `kind` (string)
   - REQUIRED for dispatch.
   - Current supported value: `linear`
+- `options` (object)
+  - Adapter-specific tracker configuration.
+  - For `tracker.kind == "linear"`, supports `endpoint`, `api_key`, `project_slug`, and `assignee`.
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
+  - Backward-compatible shortcut for `tracker.options.endpoint`.
 - `api_key` (string)
   - MAY be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
+  - Backward-compatible shortcut for `tracker.options.api_key`.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
+  - Backward-compatible shortcut for `tracker.options.project_slug`.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -571,9 +577,13 @@ Extension fields are documented in the extension section that defines them. Core
 not require recognizing or validating extension fields unless that extension is implemented.
 
 - `tracker.kind`: string, REQUIRED, currently `linear`
-- `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
-- `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.options`: map, adapter-specific configuration for the selected `tracker.kind`
+- `tracker.options.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
+- `tracker.options.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
+- `tracker.options.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.endpoint`: legacy shortcut for `tracker.options.endpoint`
+- `tracker.api_key`: legacy shortcut for `tracker.options.api_key`
+- `tracker.project_slug`: legacy shortcut for `tracker.options.project_slug`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -1136,13 +1146,19 @@ Note:
 
 An implementation MUST support these tracker adapter operations:
 
-1. `fetch_candidate_issues()`
+1. `capabilities()`
+   - Return adapter-declared operation support.
+
+2. `validate_settings(settings)`
+   - Validate adapter-specific tracker settings.
+
+3. `fetch_candidate_issues()`
    - Return issues in configured active states for a configured project.
 
-2. `fetch_issues_by_states(state_names)`
+4. `fetch_issues_by_states(state_names)`
    - Used for startup terminal cleanup.
 
-3. `fetch_issue_states_by_ids(issue_ids)`
+5. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
 ### 11.2 Query Semantics (Linear)
@@ -1152,7 +1168,7 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - `tracker.kind == "linear"`
 - GraphQL endpoint (default `https://api.linear.app/graphql`)
 - Auth token sent in `Authorization` header
-- `tracker.project_slug` maps to Linear project `slugId`
+- `tracker.options.project_slug` maps to Linear project `slugId`
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
 - Pagination REQUIRED for candidate issues
@@ -1663,7 +1679,7 @@ Possible hardening measures include:
   of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
   separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
+- Filtering which issues, projects, teams, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
   intended project scope, rather than exposing general workspace-wide tracker access.
@@ -1941,6 +1957,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
 - `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.options` preserves adapter-specific values and is populated from legacy Linear shortcut fields
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
