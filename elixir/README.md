@@ -158,6 +158,9 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.state_prompts` maps complete tracker-native state values to first-turn guidance appended
+  after the workflow body prompt. Keys are matched using trim/lowercase normalization, and duplicate
+  normalized keys are rejected during validation. Values must be non-empty strings.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -184,6 +187,12 @@ Notes:
 tracker:
   options:
     api_key: $LINEAR_API_KEY
+agent:
+  state_prompts:
+    state:ready-for-dev: |
+      Start fresh development work from the issue details.
+    state:to-rework: |
+      Address review feedback and preserve existing progress.
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:

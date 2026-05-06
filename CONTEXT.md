@@ -36,6 +36,10 @@ _Avoid_: GitHub Project, ProjectV2 item
 The stable identifier Symphony uses to claim, reconcile, and route one normalized tracker issue.
 _Avoid_: Issue number, database ID
 
+**State Prompt**:
+An initial agent prompt variant selected by the normalized tracker issue state.
+_Avoid_: Label prompt, status prompt
+
 ## Relationships
 
 - A **Tracker Adapter** belongs to exactly one tracker backend.
@@ -63,6 +67,16 @@ _Avoid_: Issue number, database ID
 - GitHub supports an optional `endpoint` **Tracker Option** for Enterprise API hosts; its default endpoint is adapter-specific.
 - Label-based tracker adapters match label prefixes case-insensitively and normalize label-derived state values to lowercase.
 - A **Label State** update target must include the complete `state:` prefix, even when the target is outside active or terminal **State Sets**.
+- A **State Prompt** is selected from `Tracker.Issue.state`, so GitHub and Linear use the same prompt-selection mechanism after tracker normalization.
+- A **State Prompt** is configured with complete tracker-native state values and falls back to the workflow body prompt when no state-specific prompt matches.
+- A **State Prompt** is appended to the workflow body prompt for the first agent turn rather than replacing the workflow body prompt.
+- A **State Prompt** applies only to the first agent turn of a run; continuation turns keep using continuation guidance.
+- A **State Prompt** uses the same prompt template variables as the workflow body prompt.
+- **State Prompt** keys match normalized tracker issue states using trim and lowercase semantics.
+- A **State Prompt** configuration must not contain duplicate keys after state normalization.
+- A **State Prompt** key must not be blank after trim, and its prompt guidance must be a non-empty string.
+- A **State Prompt** key does not need to be a member of an active **State Set**, though it is only used when an issue is dispatched.
+- When appended, a **State Prompt** is separated from the workflow body prompt with a fixed state guidance section heading.
 
 ## Example Dialogue
 
@@ -75,3 +89,4 @@ _Avoid_: Issue number, database ID
 - "read adapter" and "write adapter" were considered as separate boundaries; deferred in favor of a single **Tracker Adapter** that declares **Tracker Capabilities**.
 - GitHub issue labels can contain multiple values, but a **Label State** must be unique per issue so Symphony can produce one normalized tracker issue state.
 - "project" in the first GitHub slice means a `project:` **Scope Label**, not a GitHub Projects v2 item; GitHub Projects v2 support is deferred.
+- "different label prompt" was clarified to mean a **State Prompt** selected from the active tracker state, not arbitrary issue labels.

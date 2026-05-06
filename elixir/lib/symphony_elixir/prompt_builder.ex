@@ -12,6 +12,7 @@ defmodule SymphonyElixir.PromptBuilder do
     template =
       Workflow.current()
       |> prompt_template!()
+      |> append_state_prompt(issue)
       |> parse_template!()
 
     template
@@ -61,4 +62,59 @@ defmodule SymphonyElixir.PromptBuilder do
       prompt
     end
   end
+
+  defp append_state_prompt(prompt, issue) when is_binary(prompt) do
+    case state_prompt_for(issue) do
+      prompt_variant when is_binary(prompt_variant) ->
+        """
+        #{String.trim_trailing(prompt)}
+
+        State guidance for #{issue.state}:
+
+        #{prompt_variant}
+        """
+        |> String.trim_trailing()
+
+      nil ->
+        prompt
+    end
+  end
+
+  defp state_prompt_for(%{state: state}) when is_binary(state) do
+    state_prompts()
+    |> Map.get(normalize_state_key(state))
+    |> normalize_state_prompt()
+  end
+
+  defp state_prompt_for(_issue), do: nil
+
+  defp state_prompts do
+    case Config.settings() do
+      {:ok, settings} ->
+        settings.agent.state_prompts
+        |> normalize_state_prompt_keys()
+
+      {:error, _reason} ->
+        %{}
+    end
+  end
+
+  defp normalize_state_prompt_keys(prompts) when is_map(prompts) do
+    Map.new(prompts, fn {state, prompt} -> {normalize_state_key(state), prompt} end)
+  end
+
+  defp normalize_state_prompt_keys(_prompts), do: %{}
+
+  defp normalize_state_key(state) do
+    state
+    |> to_string()
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_state_prompt(prompt) when is_binary(prompt) do
+    if String.trim(prompt) == "", do: nil, else: prompt
+  end
+
+  defp normalize_state_prompt(_prompt), do: nil
 end

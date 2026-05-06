@@ -485,6 +485,17 @@ Fallback prompt behavior:
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
+State prompt behavior:
+
+- `agent.state_prompts` MAY define first-turn prompt guidance keyed by tracker-native issue state.
+- State prompt keys match normalized issue states using trim and lowercase semantics.
+- State prompt keys MUST NOT be blank after trim, and values MUST be non-empty strings.
+- When a state prompt matches, append it to the workflow body prompt under a fixed state guidance
+  section heading.
+- State prompts use the same template input variables as the workflow body prompt.
+- State prompts apply only to the first turn of a worker run; continuation turns SHOULD keep using
+  continuation guidance.
+
 ### 5.5 Workflow Validation and Error Surface
 
 Error classes:
@@ -568,6 +579,8 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
+- `agent.state_prompts` contains non-blank keys, non-empty string values, and no duplicate keys
+  after tracker state normalization.
 - `codex.command` is present and non-empty.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
@@ -602,6 +615,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `agent.state_prompts`: map of tracker-native state values to first-turn prompt guidance, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined

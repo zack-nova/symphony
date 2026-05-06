@@ -1054,6 +1054,78 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_github_state_set, :active_states, "ready-for-dev"}} = Config.validate!()
   end
 
+  test "config rejects duplicate state prompt keys after state normalization" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        Todo: |
+          Start work.
+        " todo ": |
+          Duplicate after normalization.
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:duplicate_state_prompt, "todo"}} = Config.validate!()
+  end
+
+  test "config rejects invalid state prompt entries" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        " ": |
+          Blank state key.
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, :blank_state_prompt_key} = Config.validate!()
+
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        todo: 123
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:invalid_state_prompt, "todo", :not_a_string}} = Config.validate!()
+
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        todo: " "
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:invalid_state_prompt, "todo", :blank}} = Config.validate!()
+  end
+
   test "config no longer resolves legacy env: references" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

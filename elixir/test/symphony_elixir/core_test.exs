@@ -786,6 +786,95 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "prompt builder appends matching state prompt to initial prompt" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        state:to-rework: |
+          You are addressing review feedback for {{ issue.identifier }}.
+          Focus only on requested rework.
+    ---
+    Ticket {{ issue.identifier }} {{ issue.title }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "owner/repo#123",
+      title: "Fix parser edge case",
+      description: "Reviewer found an edge case.",
+      state: "state:to-rework",
+      labels: ["project:orbit", "state:to-rework"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Ticket owner/repo#123 Fix parser edge case"
+    assert prompt =~ "State guidance for state:to-rework:"
+    assert prompt =~ "You are addressing review feedback for owner/repo#123."
+    assert prompt =~ "Focus only on requested rework."
+  end
+
+  test "prompt builder matches state prompt keys case-insensitively" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        rework: |
+          Handle Linear review feedback for {{ issue.identifier }}.
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "LIN-123",
+      title: "Revise implementation",
+      state: "Rework",
+      labels: []
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Ticket LIN-123"
+    assert prompt =~ "State guidance for Rework:"
+    assert prompt =~ "Handle Linear review feedback for LIN-123."
+  end
+
+  test "prompt builder leaves initial prompt unchanged when no state prompt matches" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        state:to-rework: |
+          This should not appear.
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "owner/repo#124",
+      title: "Start new work",
+      state: "state:ready-for-dev",
+      labels: []
+    }
+
+    assert PromptBuilder.build_prompt(issue) == "Ticket owner/repo#124"
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 
