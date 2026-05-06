@@ -73,6 +73,7 @@ defmodule SymphonyElixir.Tracker do
 
   @spec adapter_for_kind(String.t() | nil) :: {:ok, module()} | {:error, term()}
   def adapter_for_kind(nil), do: {:error, :missing_tracker_kind}
+  def adapter_for_kind("github"), do: {:ok, SymphonyElixir.GitHub.Adapter}
   def adapter_for_kind("linear"), do: {:ok, SymphonyElixir.Linear.Adapter}
   def adapter_for_kind("memory"), do: {:ok, SymphonyElixir.Tracker.Memory}
   def adapter_for_kind(kind), do: {:error, {:unsupported_tracker_kind, kind}}

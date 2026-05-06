@@ -576,11 +576,16 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`
+- `tracker.kind`: string, REQUIRED, currently `linear` or `github`
 - `tracker.options`: map, adapter-specific configuration for the selected `tracker.kind`
 - `tracker.options.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.options.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.options.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.options.repository`: string, REQUIRED when `tracker.kind=github`
+- `tracker.options.scope`: map, REQUIRED when `tracker.kind=github`; supported values are
+  `type: label` with one `project:` label or `type: repository`
+- `tracker.options.endpoint`: string, default `https://api.github.com` when `tracker.kind=github`
+- `tracker.options.api_key`: string or `$VAR`, canonical env `GITHUB_TOKEN` when `tracker.kind=github`
 - `tracker.endpoint`: legacy shortcut for `tracker.options.endpoint`
 - `tracker.api_key`: legacy shortcut for `tracker.options.api_key`
 - `tracker.project_slug`: legacy shortcut for `tracker.options.project_slug`
@@ -1140,7 +1145,7 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract
 
 ### 11.1 REQUIRED Operations
 
@@ -1183,7 +1188,26 @@ Important:
 A non-Linear implementation MAY change transport details, but the normalized outputs MUST match the
 domain model in Section 4.
 
-### 11.3 Normalization Rules
+### 11.3 Query Semantics (GitHub Label-State)
+
+GitHub-specific requirements for `tracker.kind == "github"`:
+
+- `tracker.options.repository` names one `owner/repo` repository.
+- `tracker.options.scope` is explicit. `type: label` uses one `project:` scope label; `type:
+  repository` intentionally inspects every issue in the repository.
+- Candidate polling reads open issues inside scope, validates each returned issue has exactly one
+  `state:` label, then filters by configured active states.
+- `state:` label matching is case-insensitive; normalized issue state stores the full lowercased
+  label value, for example `state:ready-for-dev`.
+- `fetch_issue_states_by_ids(issue_ids)` accepts normalized GitHub issue identities in
+  `owner/repo#number` form and validates the specific issues being reconciled.
+- `fetch_issues_by_states(state_names)` queries issues matching the requested `state:` labels inside
+  scope and does not audit every scoped issue.
+- `update_issue_state(issue_id, state_name)` requires `state_name` to include the full `state:`
+  prefix, replaces only the existing `state:` label, preserves scope and ordinary labels, and
+  synchronizes GitHub open/closed state from the configured terminal state set.
+
+### 11.4 Normalization Rules
 
 Candidate issue normalization SHOULD produce fields listed in Section 4.1.1.
 
@@ -1194,7 +1218,7 @@ Additional normalization details:
 - `priority` -> integer only (non-integers become null)
 - `created_at` and `updated_at` -> parse ISO-8601 timestamps
 
-### 11.4 Error Handling Contract
+### 11.5 Error Handling Contract
 
 RECOMMENDED error categories:
 
@@ -1206,6 +1230,10 @@ RECOMMENDED error categories:
 - `linear_graphql_errors`
 - `linear_unknown_payload`
 - `linear_missing_end_cursor` (pagination integrity error)
+- `github_api_request` (transport failures)
+- `github_api_status` (unexpected HTTP status)
+- `github_unknown_payload`
+- `invalid_label_state`
 
 Orchestrator behavior on tracker errors:
 
@@ -1213,7 +1241,7 @@ Orchestrator behavior on tracker errors:
 - Running-state refresh failure: log and keep active workers running.
 - Startup terminal cleanup failure: log warning and continue startup.
 
-### 11.5 Tracker Writes (Important Boundary)
+### 11.6 Tracker Writes (Important Boundary)
 
 Symphony does not require first-class tracker write APIs in the orchestrator.
 
@@ -2114,7 +2142,7 @@ Use the same validation profiles as Section 17:
   implementation details.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- TODO: Add tracker contract layers for richer issue body sections, review artifacts, and land gates.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 

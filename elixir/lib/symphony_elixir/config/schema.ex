@@ -7,6 +7,9 @@ defmodule SymphonyElixir.Config.Schema do
 
   alias SymphonyElixir.PathSafety
 
+  @linear_default_endpoint "https://api.linear.app/graphql"
+  @github_default_endpoint "https://api.github.com"
+
   @primary_key false
 
   @type t :: %__MODULE__{}
@@ -384,31 +387,44 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_tracker(tracker) do
+    kind = tracker.kind
+
     tracker = %{
       tracker
-      | api_key: resolve_secret_setting(tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+      | api_key: resolve_secret_setting(tracker.api_key, default_tracker_api_key(kind)),
+        assignee: resolve_secret_setting(tracker.assignee, default_tracker_assignee(kind))
     }
 
-    options = tracker_options(tracker)
+    options = tracker_options(tracker, kind)
+    endpoint = Map.get(options, "endpoint", default_tracker_endpoint(kind))
+    api_key = Map.get(options, "api_key", tracker.api_key)
+    project_slug = Map.get(options, "project_slug", tracker.project_slug)
+    assignee = Map.get(options, "assignee", tracker.assignee)
+
+    options =
+      options
+      |> put_option(:endpoint, endpoint)
+      |> put_option(:api_key, api_key)
+      |> put_option(:project_slug, project_slug)
+      |> put_option(:assignee, assignee)
 
     %{
       tracker
-      | endpoint: Map.get(options, "endpoint", tracker.endpoint),
-        api_key: Map.get(options, "api_key", tracker.api_key),
-        project_slug: Map.get(options, "project_slug", tracker.project_slug),
-        assignee: Map.get(options, "assignee", tracker.assignee),
+      | endpoint: endpoint,
+        api_key: api_key,
+        project_slug: project_slug,
+        assignee: assignee,
         options: options
     }
   end
 
-  defp tracker_options(tracker) do
+  defp tracker_options(tracker, kind) do
     tracker
-    |> legacy_tracker_options()
-    |> Map.merge(resolve_tracker_options(tracker.options || %{}))
+    |> legacy_tracker_options(kind)
+    |> Map.merge(resolve_tracker_options(tracker.options || %{}, kind))
   end
 
-  defp legacy_tracker_options(tracker) do
+  defp legacy_tracker_options(tracker, "linear") do
     %{}
     |> put_option(:endpoint, tracker.endpoint)
     |> put_option(:api_key, tracker.api_key)
@@ -416,16 +432,38 @@ defmodule SymphonyElixir.Config.Schema do
     |> put_option(:assignee, tracker.assignee)
   end
 
-  defp resolve_tracker_options(options) when is_map(options) do
+  defp legacy_tracker_options(tracker, _kind) do
+    %{}
+    |> put_non_linear_endpoint_option(tracker.endpoint)
+    |> put_option(:api_key, tracker.api_key)
+    |> put_option(:assignee, tracker.assignee)
+  end
+
+  defp put_non_linear_endpoint_option(options, @linear_default_endpoint), do: options
+  defp put_non_linear_endpoint_option(options, endpoint), do: put_option(options, :endpoint, endpoint)
+
+  defp resolve_tracker_options(options, kind) when is_map(options) do
     options
     |> normalize_keys()
-    |> Map.update("api_key", nil, &resolve_secret_setting(&1, System.get_env("LINEAR_API_KEY")))
-    |> Map.update("assignee", nil, &resolve_secret_setting(&1, System.get_env("LINEAR_ASSIGNEE")))
+    |> Map.update("api_key", nil, &resolve_secret_setting(&1, default_tracker_api_key(kind)))
+    |> Map.update("assignee", nil, &resolve_secret_setting(&1, default_tracker_assignee(kind)))
     |> drop_nil_values()
   end
 
   defp put_option(options, _key, nil), do: options
   defp put_option(options, key, value), do: Map.put(options, to_string(key), value)
+
+  defp default_tracker_endpoint("github"), do: @github_default_endpoint
+  defp default_tracker_endpoint(_kind), do: @linear_default_endpoint
+
+  defp default_tracker_api_key("github"), do: System.get_env("GITHUB_TOKEN")
+  defp default_tracker_api_key(nil), do: System.get_env("LINEAR_API_KEY")
+  defp default_tracker_api_key("linear"), do: System.get_env("LINEAR_API_KEY")
+  defp default_tracker_api_key(_kind), do: nil
+
+  defp default_tracker_assignee(nil), do: System.get_env("LINEAR_ASSIGNEE")
+  defp default_tracker_assignee("linear"), do: System.get_env("LINEAR_ASSIGNEE")
+  defp default_tracker_assignee(_kind), do: nil
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

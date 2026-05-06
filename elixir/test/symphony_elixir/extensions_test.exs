@@ -216,6 +216,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     assert SymphonyElixir.Tracker.capabilities() == expected_capabilities
 
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "github")
+    assert SymphonyElixir.Tracker.capabilities() == expected_capabilities
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.capabilities() == expected_capabilities
   end

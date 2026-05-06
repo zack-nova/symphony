@@ -991,6 +991,69 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert :ok = Config.validate!()
   end
 
+  test "github tracker can be configured through tracker options with github token default" do
+    previous_github_token = System.get_env("GITHUB_TOKEN")
+
+    System.put_env("GITHUB_TOKEN", "resolved-github-token")
+
+    on_exit(fn -> restore_env("GITHUB_TOKEN", previous_github_token) end)
+
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      active_states: ["state:ready-for-dev"]
+      terminal_states: ["state:merged"]
+      options:
+        repository: "owner/repo"
+        scope:
+          type: label
+          label: "project:orbit"
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    config = Config.settings!()
+
+    assert config.tracker.endpoint == "https://api.github.com"
+    assert config.tracker.api_key == "resolved-github-token"
+
+    assert config.tracker.options == %{
+             "endpoint" => "https://api.github.com",
+             "api_key" => "resolved-github-token",
+             "repository" => "owner/repo",
+             "scope" => %{"type" => "label", "label" => "project:orbit"}
+           }
+
+    assert :ok = Config.validate!()
+  end
+
+  test "github tracker requires full label state values in state sets" do
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      active_states: ["ready-for-dev"]
+      terminal_states: ["state:merged"]
+      options:
+        repository: "owner/repo"
+        api_key: "github-token"
+        scope:
+          type: label
+          label: "project:orbit"
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:invalid_github_state_set, :active_states, "ready-for-dev"}} = Config.validate!()
+  end
+
   test "config no longer resolves legacy env: references" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
