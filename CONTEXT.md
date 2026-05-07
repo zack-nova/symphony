@@ -37,8 +37,12 @@ The stable identifier Symphony uses to claim, reconcile, and route one normalize
 _Avoid_: Issue number, database ID
 
 **State Prompt**:
-An initial agent prompt variant selected by the normalized tracker issue state.
+A state-selected agent guidance block selected by the normalized tracker issue state.
 _Avoid_: Label prompt, status prompt
+
+**Active State Guidance Refresh**:
+A state guidance update sent when a running issue moves from one active tracker state to another active tracker state.
+_Avoid_: Prompt hot reload, state prompt retry
 
 ## Relationships
 
@@ -70,8 +74,18 @@ _Avoid_: Label prompt, status prompt
 - A **State Prompt** is selected from `Tracker.Issue.state`, so GitHub and Linear use the same prompt-selection mechanism after tracker normalization.
 - A **State Prompt** is configured with complete tracker-native state values and falls back to the workflow body prompt when no state-specific prompt matches.
 - A **State Prompt** is appended to the workflow body prompt for the first agent turn rather than replacing the workflow body prompt.
-- A **State Prompt** applies only to the first agent turn of a run; continuation turns keep using continuation guidance.
+- A **State Prompt** can also be sent through an **Active State Guidance Refresh** when a running issue changes between active **State Set** values.
+- An **Active State Guidance Refresh** is only sent when the new active state has a matching **State Prompt**; otherwise Symphony only refreshes the running issue snapshot.
+- An **Active State Guidance Refresh** does not apply when a running issue leaves active **State Set** values or enters terminal **State Set** values.
+- An **Active State Guidance Refresh** should steer the current turn without interrupting it.
+- If a current turn has already completed before **Active State Guidance Refresh** steering is attempted, the latest refresh guidance is delivered with the next continuation turn instead of failing the worker run.
+- Failed **Active State Guidance Refresh** steering makes the worker run fail so retry can resume with required state guidance instead of allowing the agent to continue under stale guidance.
+- Pending **Active State Guidance Refresh** delivery is appended to continuation guidance and does not resend the workflow body prompt.
+- When multiple **Active State Guidance Refreshes** are detected before pending guidance is delivered, Symphony keeps only the latest state guidance.
+- Each entry into an active state receives at most one delivered **Active State Guidance Refresh** unless the issue leaves and later re-enters that state.
+- **Active State Guidance Refresh** delivery is based on observed tracker state transitions, regardless of whether the transition was made by a human or by the running agent.
 - A **State Prompt** uses the same prompt template variables as the workflow body prompt.
+- An **Active State Guidance Refresh** renders a **State Prompt** with the same template variables as the first agent turn, without transition-specific variables such as previous state.
 - **State Prompt** keys match normalized tracker issue states using trim and lowercase semantics.
 - A **State Prompt** configuration must not contain duplicate keys after state normalization.
 - A **State Prompt** key must not be blank after trim, and its prompt guidance must be a non-empty string.
@@ -90,3 +104,5 @@ _Avoid_: Label prompt, status prompt
 - GitHub issue labels can contain multiple values, but a **Label State** must be unique per issue so Symphony can produce one normalized tracker issue state.
 - "project" in the first GitHub slice means a `project:` **Scope Label**, not a GitHub Projects v2 item; GitHub Projects v2 support is deferred.
 - "different label prompt" was clarified to mean a **State Prompt** selected from the active tracker state, not arbitrary issue labels.
+- "turn-time state prompt injection" was clarified as an **Active State Guidance Refresh**, not a restart of the current agent run.
+- "multiple state prompt injections" was resolved with latest-state-wins pending **Active State Guidance Refresh** delivery.

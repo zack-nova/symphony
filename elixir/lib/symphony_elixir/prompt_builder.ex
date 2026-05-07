@@ -26,6 +26,35 @@ defmodule SymphonyElixir.PromptBuilder do
     |> IO.iodata_to_binary()
   end
 
+  @spec build_state_guidance(SymphonyElixir.Tracker.Issue.t(), keyword()) :: String.t() | nil
+  def build_state_guidance(issue, opts \\ []) do
+    case state_prompt_for(issue) do
+      prompt_variant when is_binary(prompt_variant) ->
+        rendered_prompt =
+          prompt_variant
+          |> parse_template!()
+          |> Solid.render!(
+            %{
+              "attempt" => Keyword.get(opts, :attempt),
+              "issue" => issue |> Map.from_struct() |> to_solid_map()
+            },
+            @render_opts
+          )
+          |> IO.iodata_to_binary()
+          |> String.trim_trailing()
+
+        """
+        #{Keyword.get(opts, :heading, "State guidance for")} #{issue.state}:
+
+        #{rendered_prompt}
+        """
+        |> String.trim_trailing()
+
+      nil ->
+        nil
+    end
+  end
+
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
 
   defp prompt_template!({:error, reason}) do

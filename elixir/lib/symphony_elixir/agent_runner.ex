@@ -83,22 +83,24 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns, nil)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, pending_state_guidance_issue) do
+    pending_state_guidance_issue = drain_pending_state_guidance_refresh(pending_state_guidance_issue)
 
-    with {:ok, turn_session} <-
+    with {:ok, prompt} <- build_turn_prompt_result(issue, opts, turn_number, max_turns, pending_state_guidance_issue),
+         {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             on_external_message: codex_external_message_handler(opts)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -114,7 +116,8 @@ defmodule SymphonyElixir.AgentRunner do
             opts,
             issue_state_fetcher,
             turn_number + 1,
-            max_turns
+            max_turns,
+            nil
           )
 
         {:continue, refreshed_issue} ->
@@ -131,10 +134,21 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt_result(issue, opts, turn_number, max_turns, pending_state_guidance_issue) do
+    {:ok, build_turn_prompt(issue, opts, turn_number, max_turns, pending_state_guidance_issue)}
+  rescue
+    error ->
+      if match?(%Issue{}, pending_state_guidance_issue) do
+        {:error, {:state_guidance_render_failed, Exception.message(error)}}
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
-    """
+  defp build_turn_prompt(issue, opts, 1, _max_turns, _pending_state_guidance_issue), do: PromptBuilder.build_prompt(issue, opts)
+
+  defp build_turn_prompt(_issue, opts, turn_number, max_turns, pending_state_guidance_issue) do
+    continuation_guidance = """
     Continuation guidance:
 
     - The previous Codex turn completed normally, but the tracker issue is still in an active state.
@@ -143,6 +157,90 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+
+    append_pending_state_guidance(continuation_guidance, pending_state_guidance_issue, opts)
+  end
+
+  defp append_pending_state_guidance(continuation_guidance, nil, _opts), do: continuation_guidance
+
+  defp append_pending_state_guidance(continuation_guidance, %Issue{} = pending_state_guidance_issue, opts) do
+    case build_active_state_guidance_refresh(pending_state_guidance_issue, opts) do
+      guidance when is_binary(guidance) ->
+        """
+        #{String.trim_trailing(continuation_guidance)}
+
+        #{guidance}
+        """
+        |> String.trim_trailing()
+
+      nil ->
+        continuation_guidance
+    end
+  end
+
+  defp drain_pending_state_guidance_refresh(latest_issue) do
+    receive do
+      {:active_state_guidance_refresh, %Issue{} = refreshed_issue} ->
+        drain_pending_state_guidance_refresh(refreshed_issue)
+    after
+      0 ->
+        latest_issue
+    end
+  end
+
+  defp codex_external_message_handler(opts) do
+    fn
+      {:active_state_guidance_refresh, %Issue{} = refreshed_issue}, turn_session ->
+        send_active_state_guidance_refresh(refreshed_issue, turn_session, opts)
+
+      _message, _turn_session ->
+        :unhandled
+    end
+  end
+
+  defp send_active_state_guidance_refresh(%Issue{} = refreshed_issue, turn_session, opts) do
+    case build_active_state_guidance_refresh_result(refreshed_issue, opts) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, guidance} ->
+        steer_active_turn(turn_session, guidance)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp build_active_state_guidance_refresh_result(%Issue{} = refreshed_issue, opts) do
+    {:ok, build_active_state_guidance_refresh(refreshed_issue, opts)}
+  rescue
+    error ->
+      {:error, {:state_guidance_render_failed, Exception.message(error)}}
+  end
+
+  defp steer_active_turn(turn_session, guidance) do
+    case AppServer.steer_turn(turn_session, turn_session.turn_id, guidance) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:state_guidance_refresh_failed, reason}}
+    end
+  rescue
+    error ->
+      {:error, {:state_guidance_refresh_failed, Exception.message(error)}}
+  end
+
+  defp build_active_state_guidance_refresh(%Issue{} = refreshed_issue, opts) do
+    case PromptBuilder.build_state_guidance(refreshed_issue, Keyword.put(opts, :heading, "Updated state guidance for")) do
+      guidance when is_binary(guidance) ->
+        """
+        #{guidance}
+
+        This guidance supersedes earlier state guidance for this active run.
+        """
+        |> String.trim_trailing()
+
+      nil ->
+        nil
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

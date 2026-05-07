@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @turn_steer_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -76,12 +77,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace
-        },
+        } = session,
         prompt,
         issue,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    on_external_message = Keyword.get(opts, :on_external_message)
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
@@ -92,6 +94,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+        turn_session = Map.merge(session, %{session_id: session_id, turn_id: turn_id})
 
         emit_message(
           on_message,
@@ -104,7 +107,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, on_external_message, turn_session) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -136,6 +139,30 @@ defmodule SymphonyElixir.Codex.AppServer do
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
+    end
+  end
+
+  @spec steer_turn(session(), String.t(), String.t()) :: :ok | {:error, term()}
+  def steer_turn(%{port: port, thread_id: thread_id}, turn_id, guidance)
+      when is_port(port) and is_binary(thread_id) and is_binary(turn_id) and is_binary(guidance) do
+    send_message(port, %{
+      "method" => "turn/steer",
+      "id" => @turn_steer_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "expectedTurnId" => turn_id,
+        "input" => [
+          %{
+            "type" => "text",
+            "text" => guidance
+          }
+        ]
+      }
+    })
+
+    case await_response(port, @turn_steer_id, preserve_unmatched: true) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -326,22 +353,25 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, on_external_message, turn_session) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      on_external_message,
+      turn_session,
+      []
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -350,24 +380,42 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          on_external_message,
+          turn_session,
+          deferred_messages
         )
 
       {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
+        handle_port_exit(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages, status)
+
+      message when is_function(on_external_message, 2) ->
+        case on_external_message.(message, turn_session) do
+          result when result in [:ok, :handled] ->
+            receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+
+          :unhandled ->
+            receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, [message | deferred_messages])
+
+          {:error, reason} ->
+            return_with_deferred_messages({:error, reason}, deferred_messages)
+
+          other ->
+            return_with_deferred_messages({:error, {:external_message_handler_failed, other}}, deferred_messages)
+        end
     after
       timeout_ms ->
-        {:error, :turn_timeout}
+        return_with_deferred_messages({:error, :turn_timeout}, deferred_messages)
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        return_with_deferred_messages({:ok, :turn_completed}, deferred_messages)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -379,7 +427,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           Map.get(payload, "params")
         )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+        return_with_deferred_messages({:error, {:turn_failed, Map.get(payload, "params")}}, deferred_messages)
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
         emit_turn_event(
@@ -391,7 +439,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           Map.get(payload, "params")
         )
 
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+        return_with_deferred_messages({:error, {:turn_cancelled, Map.get(payload, "params")}}, deferred_messages)
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
@@ -403,7 +451,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          on_external_message,
+          turn_session,
+          deferred_messages
         )
 
       {:ok, payload} ->
@@ -417,7 +468,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,7 +485,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
     end
   end
 
@@ -451,6 +502,57 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  defp return_with_deferred_messages(result, deferred_messages) when is_list(deferred_messages) do
+    deferred_messages
+    |> Enum.reverse()
+    |> Enum.each(&send(self(), &1))
+
+    result
+  end
+
+  defp handle_port_exit(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages, status) do
+    case take_deferred_terminal_turn_line(port) do
+      {:ok, line} ->
+        handle_incoming(
+          port,
+          on_message,
+          pending_line <> line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          on_external_message,
+          turn_session,
+          deferred_messages
+        )
+
+      :none ->
+        return_with_deferred_messages({:error, {:port_exit, status}}, deferred_messages)
+    end
+  end
+
+  defp take_deferred_terminal_turn_line(port, deferred_messages \\ []) do
+    receive do
+      {^port, {:data, {:eol, chunk}}} = message ->
+        line = to_string(chunk)
+
+        if terminal_turn_line?(line) do
+          return_with_deferred_messages({:ok, line}, deferred_messages)
+        else
+          take_deferred_terminal_turn_line(port, [message | deferred_messages])
+        end
+    after
+      0 ->
+        return_with_deferred_messages(:none, deferred_messages)
+    end
+  end
+
+  defp terminal_turn_line?(line) when is_binary(line) do
+    case Jason.decode(line) do
+      {:ok, %{"method" => method}} when method in ["turn/completed", "turn/failed", "turn/cancelled"] -> true
+      _ -> false
+    end
+  end
+
   defp handle_turn_method(
          port,
          on_message,
@@ -459,7 +561,10 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         on_external_message,
+         turn_session,
+         deferred_messages
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -481,10 +586,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        {:error, {:turn_input_required, payload}}
+        return_with_deferred_messages({:error, {:turn_input_required, payload}}, deferred_messages)
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
 
       :approval_required ->
         emit_message(
@@ -494,7 +599,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        {:error, {:approval_required, payload}}
+        return_with_deferred_messages({:error, {:approval_required, payload}}, deferred_messages)
 
       :unhandled ->
         if needs_input?(method, payload) do
@@ -505,7 +610,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata
           )
 
-          {:error, {:turn_input_required, payload}}
+          return_with_deferred_messages({:error, {:turn_input_required, payload}}, deferred_messages)
         else
           emit_message(
             on_message,
@@ -518,7 +623,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
         end
     end
   end
@@ -919,49 +1024,72 @@ defmodule SymphonyElixir.Codex.AppServer do
     String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
   end
 
-  defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
+  defp await_response(port, request_id, opts \\ []) do
+    preserve_unmatched = Keyword.get(opts, :preserve_unmatched, false)
+    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "", [], preserve_unmatched)
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp with_timeout_response(port, request_id, timeout_ms, pending_line, deferred_messages, preserve_unmatched) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(port, request_id, complete_line, timeout_ms, deferred_messages, preserve_unmatched)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk), deferred_messages, preserve_unmatched)
 
       {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
+        return_with_deferred_messages({:error, {:port_exit, status}}, deferred_messages)
     after
       timeout_ms ->
-        {:error, :response_timeout}
+        return_with_deferred_messages({:error, :response_timeout}, deferred_messages)
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, data, timeout_ms, deferred_messages, preserve_unmatched) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
       {:ok, %{"id" => ^request_id, "error" => error}} ->
-        {:error, {:response_error, error}}
+        return_with_deferred_messages({:error, {:response_error, error}}, deferred_messages)
 
       {:ok, %{"id" => ^request_id, "result" => result}} ->
-        {:ok, result}
+        return_with_deferred_messages({:ok, result}, deferred_messages)
 
       {:ok, %{"id" => ^request_id} = response_payload} ->
-        {:error, {:response_error, response_payload}}
+        return_with_deferred_messages({:error, {:response_error, response_payload}}, deferred_messages)
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+
+        with_timeout_response(
+          port,
+          request_id,
+          timeout_ms,
+          "",
+          maybe_defer_response_message(deferred_messages, port, data, preserve_unmatched),
+          preserve_unmatched
+        )
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+
+        with_timeout_response(
+          port,
+          request_id,
+          timeout_ms,
+          "",
+          maybe_defer_response_message(deferred_messages, port, data, preserve_unmatched),
+          preserve_unmatched
+        )
     end
   end
+
+  defp maybe_defer_response_message(deferred_messages, port, data, true) do
+    [{port, {:data, {:eol, data}}} | deferred_messages]
+  end
+
+  defp maybe_defer_response_message(deferred_messages, _port, _data, false), do: deferred_messages
 
   defp log_non_json_stream_line(data, stream_label) do
     text =

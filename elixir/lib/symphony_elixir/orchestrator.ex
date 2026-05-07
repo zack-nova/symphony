@@ -147,10 +147,12 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
+              delay_type = if state_guidance_refresh_failure?(reason), do: :state_guidance_refresh, else: nil
 
               schedule_issue_retry(state, issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
+                delay_type: delay_type,
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
@@ -357,7 +359,7 @@ defmodule SymphonyElixir.Orchestrator do
         terminate_running_issue(state, issue.id, false)
 
       active_issue_state?(issue.state, active_states) ->
-        refresh_running_issue_state(state, issue)
+        refresh_running_issue_state(state, issue, active_states)
 
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
@@ -402,15 +404,37 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp log_missing_running_issue(_state, _issue_id), do: :ok
 
-  defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
+  defp refresh_running_issue_state(%State{} = state, %Issue{} = issue, active_states) do
     case Map.get(state.running, issue.id) do
-      %{issue: _} = running_entry ->
+      %{issue: previous_issue} = running_entry ->
+        maybe_send_active_state_guidance_refresh(running_entry, previous_issue, issue, active_states)
+
         %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
 
       _ ->
         state
     end
   end
+
+  defp maybe_send_active_state_guidance_refresh(%{pid: pid}, %Issue{} = previous_issue, %Issue{} = refreshed_issue, active_states)
+       when is_pid(pid) do
+    if active_state_changed?(previous_issue.state, refreshed_issue.state, active_states) do
+      send(pid, {:active_state_guidance_refresh, refreshed_issue})
+    end
+
+    :ok
+  end
+
+  defp maybe_send_active_state_guidance_refresh(_running_entry, _previous_issue, _refreshed_issue, _active_states), do: :ok
+
+  defp active_state_changed?(previous_state, refreshed_state, active_states)
+       when is_binary(previous_state) and is_binary(refreshed_state) do
+    active_issue_state?(previous_state, active_states) and
+      active_issue_state?(refreshed_state, active_states) and
+      normalize_issue_state(previous_state) != normalize_issue_state(refreshed_state)
+  end
+
+  defp active_state_changed?(_previous_state, _refreshed_state, _active_states), do: false
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
@@ -774,7 +798,8 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
-    delay_ms = retry_delay(next_attempt, metadata)
+    delay_type = Map.get(metadata, :delay_type)
+    delay_ms = retry_delay(next_attempt, Map.put(metadata, :delay_type, delay_type))
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
@@ -803,6 +828,7 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            delay_type: delay_type,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -815,6 +841,7 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          delay_type: Map.get(retry_entry, :delay_type),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -926,10 +953,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      metadata[:delay_type] == :state_guidance_refresh and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 
@@ -946,6 +978,12 @@ defmodule SymphonyElixir.Orchestrator do
       attempt when is_integer(attempt) and attempt > 0 -> attempt + 1
       _ -> nil
     end
+  end
+
+  defp state_guidance_refresh_failure?(reason) do
+    reason
+    |> inspect()
+    |> String.contains?(["state_guidance_refresh_failed", "state_guidance_render_failed"])
   end
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do

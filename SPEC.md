@@ -487,14 +487,26 @@ Fallback prompt behavior:
 
 State prompt behavior:
 
-- `agent.state_prompts` MAY define first-turn prompt guidance keyed by tracker-native issue state.
+- `agent.state_prompts` MAY define prompt guidance keyed by tracker-native issue state.
 - State prompt keys match normalized issue states using trim and lowercase semantics.
 - State prompt keys MUST NOT be blank after trim, and values MUST be non-empty strings.
 - When a state prompt matches, append it to the workflow body prompt under a fixed state guidance
   section heading.
 - State prompts use the same template input variables as the workflow body prompt.
-- State prompts apply only to the first turn of a worker run; continuation turns SHOULD keep using
-  continuation guidance.
+- The first turn uses the state prompt for the issue state observed at dispatch.
+- During a worker run, when reconciliation observes an issue moving from one active state to another
+  active state, the worker SHOULD send the new state's state prompt to the active Codex turn using
+  same-turn steering when that state has a matching state prompt.
+- Active-state guidance refreshes use the same template input variables as first-turn state prompts;
+  they do not add transition-specific variables such as previous state.
+- If the new active state has no matching state prompt, the worker SHOULD NOT send generic state
+  guidance to Codex.
+- If an active-state guidance refresh is not delivered because the current turn has already
+  completed before steering is attempted, the worker SHOULD append the latest refresh guidance to the
+  next continuation turn after the generic continuation guidance.
+- If same-turn steering or refresh state prompt rendering fails, the worker run SHOULD fail so the
+  orchestrator can retry with fresh state guidance instead of letting the agent continue under stale
+  guidance.
 
 ### 5.5 Workflow Validation and Error Surface
 
@@ -615,7 +627,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `agent.state_prompts`: map of tracker-native state values to first-turn prompt guidance, default `{}`
+- `agent.state_prompts`: map of tracker-native state values to state-selected prompt guidance, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -659,8 +671,10 @@ Important nuance:
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
+- Continuation turns SHOULD send continuation guidance to the existing thread, not resend the
+  original task prompt that is already present in thread history. If active-state guidance refresh
+  delivery was deferred because the previous turn had already completed, the next continuation turn
+  SHOULD append the latest rendered state guidance after the generic continuation guidance.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
@@ -823,6 +837,9 @@ Part B: Tracker state refresh
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
   - If tracker state is still active: update the in-memory issue snapshot.
+    - If the previous tracked state and refreshed state are both active states and differ after
+      normalization, notify the running worker of the refreshed issue so it can attempt active-state
+      guidance refresh delivery.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
@@ -982,6 +999,10 @@ client to:
 - Start the first turn with the rendered issue prompt.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
+- When a running issue changes from one active tracker state to another, steer the active turn with
+  the new state's rendered state guidance when the targeted protocol supports same-turn steering.
+  If the turn has already completed before steering is attempted, deliver the latest pending state
+  guidance with the next continuation turn.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
   targeted protocol.
 - Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
@@ -1814,6 +1835,9 @@ function reconcile_running_issues(state):
     if issue.state in terminal_states:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
     else if issue.state in active_states:
+      if state.running[issue.id].issue.state in active_states and
+         normalize(state.running[issue.id].issue.state) != normalize(issue.state):
+        send(state.running[issue.id].pid, active_state_guidance_refresh(issue))
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
