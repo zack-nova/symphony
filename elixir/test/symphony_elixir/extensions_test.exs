@@ -205,6 +205,49 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert SymphonyElixir.Tracker.adapter() == Adapter
   end
 
+  test "tracker exposes selected adapter capabilities" do
+    expected_capabilities = %{
+      comments: true,
+      state_updates: true,
+      issue_sections: false,
+      review_artifacts: false
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    assert SymphonyElixir.Tracker.capabilities() == expected_capabilities
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "github")
+    assert SymphonyElixir.Tracker.capabilities() == expected_capabilities
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+    assert SymphonyElixir.Tracker.capabilities() == expected_capabilities
+  end
+
+  test "tracker exposes normalized settings and adapter options" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_endpoint: "https://linear.example/graphql",
+      tracker_api_token: "linear-token",
+      tracker_project_slug: "project-slug"
+    )
+
+    assert SymphonyElixir.Tracker.settings().kind == "linear"
+
+    assert SymphonyElixir.Tracker.options() == %{
+             "endpoint" => "https://linear.example/graphql",
+             "api_key" => "linear-token",
+             "project_slug" => "project-slug"
+           }
+  end
+
+  test "memory tracker uses tracker-neutral issue model" do
+    issue = %SymphonyElixir.Tracker.Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
+  end
+
   test "linear adapter delegates reads and validates mutation responses" do
     Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
 

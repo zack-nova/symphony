@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
-  You are working on a Linear issue.
+  You are working on a tracker issue.
 
   Identifier: {{ issue.identifier }}
   Title: {{ issue.title }}
@@ -115,22 +115,63 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        :ok
+    with :ok <- validate_state_prompts(settings.agent.state_prompts) do
+      SymphonyElixir.Tracker.validate_settings(settings.tracker)
     end
+  end
+
+  defp validate_state_prompts(prompts) when is_map(prompts) do
+    prompts
+    |> Enum.map(fn {key, prompt} -> {normalize_state_prompt_key(key), prompt} end)
+    |> find_duplicate_state_prompt()
+    |> case do
+      {:ok, entries} -> validate_state_prompt_entries(entries)
+      duplicate -> {:error, {:duplicate_state_prompt, duplicate}}
+    end
+  end
+
+  defp validate_state_prompts(_prompts), do: :ok
+
+  defp find_duplicate_state_prompt(entries) do
+    entries
+    |> Enum.reduce_while(MapSet.new(), fn key, seen ->
+      {state, _prompt} = key
+
+      if MapSet.member?(seen, state) do
+        {:halt, state}
+      else
+        {:cont, MapSet.put(seen, state)}
+      end
+    end)
+    |> case do
+      %MapSet{} -> {:ok, entries}
+      duplicate -> duplicate
+    end
+  end
+
+  defp validate_state_prompt_entries(entries) do
+    Enum.reduce_while(entries, :ok, fn {state, prompt}, :ok ->
+      cond do
+        state == "" ->
+          {:halt, {:error, :blank_state_prompt_key}}
+
+        not is_binary(prompt) ->
+          {:halt, {:error, {:invalid_state_prompt, state, :not_a_string}}}
+
+        String.trim(prompt) == "" ->
+          {:halt, {:error, {:invalid_state_prompt, state, :blank}}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp normalize_state_prompt_key(key) do
+    key
+    |> to_string()
+    |> String.trim()
+    |> String.downcase()
   end
 
   defp format_config_error(reason) do

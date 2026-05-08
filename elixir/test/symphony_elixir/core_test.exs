@@ -465,6 +465,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.has_key?(updated_state.running, issue_id)
     assert MapSet.member?(updated_state.claimed, issue_id)
     assert updated_entry.issue.state == "In Progress"
+    assert_receive {:active_state_guidance_refresh, %Issue{id: ^issue_id, state: "In Progress"}}
   end
 
   test "reconcile stops running issue when it is reassigned away from this worker" do
@@ -543,15 +544,15 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    triggered_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, observed_at_ms} = wait_for_retry_attempt!(pid, issue_id)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_delay_in_range(due_at_ms, triggered_at_ms, observed_at_ms, 1_000)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -584,14 +585,14 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    triggered_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, observed_at_ms} = wait_for_retry_attempt!(pid, issue_id)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_delay_in_range(due_at_ms, triggered_at_ms, observed_at_ms, 40_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -623,14 +624,120 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    triggered_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, observed_at_ms} = wait_for_retry_attempt!(pid, issue_id)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_delay_in_range(due_at_ms, triggered_at_ms, observed_at_ms, 10_000)
+  end
+
+  test "state guidance refresh worker failure retries after a short delay" do
+    issue_id = "issue-state-guidance-refresh-failed"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :StateGuidanceRefreshRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-562",
+      issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+      session_id: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      retry_attempt: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(initial_state.running, issue_id, running_entry),
+          claimed: MapSet.put(initial_state.claimed, issue_id),
+          retry_attempts: %{}
+      }
+    end)
+
+    triggered_at_ms = System.monotonic_time(:millisecond)
+    send(pid, {:DOWN, ref, :process, self(), {:state_guidance_refresh_failed, :response_timeout}})
+    {state, observed_at_ms} = wait_for_retry_attempt!(pid, issue_id)
+
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             identifier: "MT-562",
+             error: "agent exited: {:state_guidance_refresh_failed, :response_timeout}"
+           } = state.retry_attempts[issue_id]
+
+    assert_due_delay_in_range(due_at_ms, triggered_at_ms, observed_at_ms, 1_000)
+  end
+
+  test "repeated state guidance refresh worker failure backs off" do
+    issue_id = "issue-state-guidance-refresh-failed-again"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :RepeatedStateGuidanceRefreshRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-563",
+      issue: %Issue{id: issue_id, identifier: "MT-563", state: "In Progress"},
+      session_id: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      retry_attempt: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: Map.put(initial_state.running, issue_id, running_entry),
+          claimed: MapSet.put(initial_state.claimed, issue_id),
+          retry_attempts: %{}
+      }
+    end)
+
+    triggered_at_ms = System.monotonic_time(:millisecond)
+    send(pid, {:DOWN, ref, :process, self(), {:state_guidance_refresh_failed, :response_timeout}})
+    {state, observed_at_ms} = wait_for_retry_attempt!(pid, issue_id)
+
+    assert %{
+             attempt: 2,
+             due_at_ms: due_at_ms,
+             identifier: "MT-563",
+             error: "agent exited: {:state_guidance_refresh_failed, :response_timeout}"
+           } = state.retry_attempts[issue_id]
+
+    assert_due_delay_in_range(due_at_ms, triggered_at_ms, observed_at_ms, 20_000)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,11 +857,24 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp wait_for_retry_attempt!(pid, issue_id, attempts \\ 40)
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp wait_for_retry_attempt!(_pid, issue_id, 0), do: flunk("timed out waiting for retry entry for #{issue_id}")
+
+  defp wait_for_retry_attempt!(pid, issue_id, attempts) do
+    state = :sys.get_state(pid)
+
+    if Map.has_key?(state.retry_attempts, issue_id) do
+      {state, System.monotonic_time(:millisecond)}
+    else
+      Process.sleep(25)
+      wait_for_retry_attempt!(pid, issue_id, attempts - 1)
+    end
+  end
+
+  defp assert_due_delay_in_range(due_at_ms, triggered_at_ms, observed_at_ms, expected_delay_ms) do
+    assert due_at_ms >= triggered_at_ms + expected_delay_ms
+    assert due_at_ms <= observed_at_ms + expected_delay_ms + 100
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -762,6 +882,16 @@ defmodule SymphonyElixir.CoreTest do
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
+  end
+
+  test "tracker reports missing or invalid adapter kind" do
+    assert {:error, :missing_tracker_kind} = Tracker.adapter_for_kind(nil)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "unknown")
+
+    assert_raise ArgumentError, ~r/Invalid tracker adapter/, fn ->
+      Tracker.capabilities()
+    end
   end
 
   test "prompt builder renders issue and attempt values from workflow template" do
@@ -784,6 +914,151 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+  end
+
+  test "prompt builder appends matching state prompt to initial prompt" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        state:to-rework: |
+          You are addressing review feedback for {{ issue.identifier }}.
+          Focus only on requested rework.
+    ---
+    Ticket {{ issue.identifier }} {{ issue.title }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "owner/repo#123",
+      title: "Fix parser edge case",
+      description: "Reviewer found an edge case.",
+      state: "state:to-rework",
+      labels: ["project:orbit", "state:to-rework"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Ticket owner/repo#123 Fix parser edge case"
+    assert prompt =~ "State guidance for state:to-rework:"
+    assert prompt =~ "You are addressing review feedback for owner/repo#123."
+    assert prompt =~ "Focus only on requested rework."
+  end
+
+  test "prompt builder renders matching state guidance independently" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        state:needs-review: |
+          Prepare review handoff for {{ issue.identifier }}.
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "owner/repo#125",
+      title: "Prepare review",
+      state: "state:needs-review",
+      labels: ["project:orbit", "state:needs-review"]
+    }
+
+    assert PromptBuilder.build_state_guidance(issue) ==
+             "State guidance for state:needs-review:\n\nPrepare review handoff for owner/repo#125."
+  end
+
+  test "prompt builder matches state prompt keys case-insensitively" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        rework: |
+          Handle Linear review feedback for {{ issue.identifier }}.
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "LIN-123",
+      title: "Revise implementation",
+      state: "Rework",
+      labels: []
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Ticket LIN-123"
+    assert prompt =~ "State guidance for Rework:"
+    assert prompt =~ "Handle Linear review feedback for LIN-123."
+  end
+
+  test "prompt builder leaves initial prompt unchanged when no state prompt matches" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        state:to-rework: |
+          This should not appear.
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    issue = %Issue{
+      identifier: "owner/repo#124",
+      title: "Start new work",
+      state: "state:ready-for-dev",
+      labels: []
+    }
+
+    assert PromptBuilder.build_prompt(issue) == "Ticket owner/repo#124"
+  end
+
+  test "prompt builder returns no state guidance without a matching prompt" do
+    issue = %Issue{
+      identifier: "owner/repo#124",
+      title: "Start new work",
+      state: "state:ready-for-dev",
+      labels: []
+    }
+
+    assert is_nil(PromptBuilder.build_state_guidance(issue))
+    assert is_nil(PromptBuilder.build_state_guidance(%{}))
+
+    missing_workflow = Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md")
+    Workflow.set_workflow_file_path(missing_workflow)
+
+    assert is_nil(PromptBuilder.build_state_guidance(issue))
+
+    invalid_config_workflow = """
+    ---
+    agent: invalid
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), invalid_config_workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert is_nil(PromptBuilder.build_state_guidance(issue))
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
@@ -883,7 +1158,7 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue)
 
-    assert prompt =~ "You are working on a Linear issue."
+    assert prompt =~ "You are working on a tracker issue."
     assert prompt =~ "Identifier: MT-777"
     assert prompt =~ "Title: Make fallback prompt useful"
     assert prompt =~ "Body:"
@@ -1359,6 +1634,441 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner steers the active turn with matching state guidance after active state change" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-state-guidance-refresh-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-state-guidance-refresh.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-state-guidance-refresh.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-refresh"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-refresh-1"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      workflow = """
+      ---
+      tracker:
+        kind: memory
+        active_states:
+          - state:ready-for-dev
+          - state:needs-review
+        terminal_states:
+          - Done
+      workspace:
+        root: #{inspect(workspace_root)}
+      agent:
+        max_turns: 2
+        state_prompts:
+          state:needs-review: |
+            Prepare review handoff for {{ issue.identifier }}.
+      codex:
+        command: #{inspect("#{codex_binary} app-server")}
+        turn_timeout_ms: 1000
+      hooks:
+        after_create: #{inspect("cp #{Path.join(template_repo, "README.md")} README.md")}
+      ---
+      Ticket {{ issue.identifier }}
+      """
+
+      File.write!(Workflow.workflow_file_path(), workflow)
+      assert :ok = WorkflowStore.force_reload()
+
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-refresh",
+             identifier: "owner/repo#126",
+             title: "Prepare review",
+             state: "Done"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-refresh",
+        identifier: "owner/repo#126",
+        title: "Prepare review",
+        description: "Work moves through active states",
+        state: "state:ready-for-dev",
+        url: "https://example.org/issues/126",
+        labels: ["project:orbit", "state:ready-for-dev"]
+      }
+
+      task =
+        Task.async(fn ->
+          AgentRunner.run(issue, parent, issue_state_fetcher: state_fetcher)
+        end)
+
+      assert_receive {:codex_worker_update, "issue-refresh", %{event: :session_started}}, 2_000
+
+      send(task.pid, {
+        :active_state_guidance_refresh,
+        %Issue{
+          issue
+          | state: "state:needs-review",
+            labels: ["project:orbit", "state:needs-review"]
+        }
+      })
+
+      assert :ok = Task.await(task, 3_000)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"turn/steer\""
+      assert trace =~ "Updated state guidance for state:needs-review:"
+      assert trace =~ "Prepare review handoff for owner/repo#126."
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner appends pending state guidance to the next continuation turn when the prior turn already completed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-pending-state-guidance-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-pending-state-guidance.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-pending-state-guidance.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-pending-refresh"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-pending-refresh-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-pending-refresh-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      workflow = """
+      ---
+      tracker:
+        kind: memory
+        active_states:
+          - state:ready-for-dev
+          - state:needs-review
+        terminal_states:
+          - Done
+      workspace:
+        root: #{inspect(workspace_root)}
+      agent:
+        max_turns: 3
+        state_prompts:
+          state:needs-review: |
+            Prepare review handoff for {{ issue.identifier }}.
+      codex:
+        command: #{inspect("#{codex_binary} app-server")}
+      hooks:
+        after_create: #{inspect("cp #{Path.join(template_repo, "README.md")} README.md")}
+      ---
+      Ticket {{ issue.identifier }}
+      """
+
+      File.write!(Workflow.workflow_file_path(), workflow)
+      assert :ok = WorkflowStore.force_reload()
+
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:pending_refresh_fetch_count, 0) + 1
+        Process.put(:pending_refresh_fetch_count, attempt)
+        send(parent, {:pending_refresh_issue_state_fetch, attempt})
+
+        if attempt == 1 do
+          receive do
+            :allow_pending_refresh_fetch -> :ok
+          after
+            2_000 -> flunk("timed out waiting to release first state refresh")
+          end
+        end
+
+        state = if attempt == 1, do: "state:needs-review", else: "Done"
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-pending-refresh",
+             identifier: "owner/repo#127",
+             title: "Prepare pending review",
+             state: state
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-pending-refresh",
+        identifier: "owner/repo#127",
+        title: "Prepare pending review",
+        description: "Work moves through active states",
+        state: "state:ready-for-dev",
+        url: "https://example.org/issues/127",
+        labels: ["project:orbit", "state:ready-for-dev"]
+      }
+
+      task =
+        Task.async(fn ->
+          AgentRunner.run(issue, parent, issue_state_fetcher: state_fetcher)
+        end)
+
+      assert_receive {:pending_refresh_issue_state_fetch, 1}, 2_000
+
+      send(task.pid, {
+        :active_state_guidance_refresh,
+        %Issue{
+          issue
+          | state: "state:needs-review",
+            labels: ["project:orbit", "state:needs-review"]
+        }
+      })
+
+      send(task.pid, :allow_pending_refresh_fetch)
+
+      assert :ok = Task.await(task, 3_000)
+
+      turn_texts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
+      assert Enum.at(turn_texts, 1) =~ "Updated state guidance for state:needs-review:"
+      assert Enum.at(turn_texts, 1) =~ "Prepare review handoff for owner/repo#127."
+      refute File.read!(trace_file) =~ "\"method\":\"turn/steer\""
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner tags pending state guidance render failures" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-pending-state-guidance-render-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-pending-state-guidance-render-failure.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-pending-state-guidance-render-failure.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-pending-render-failure"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-pending-render-failure-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      workflow = """
+      ---
+      tracker:
+        kind: memory
+        active_states:
+          - state:ready-for-dev
+          - state:needs-review
+        terminal_states:
+          - Done
+      workspace:
+        root: #{inspect(workspace_root)}
+      agent:
+        max_turns: 2
+        state_prompts:
+          state:needs-review: |
+            Prepare {{ missing.value }}.
+      codex:
+        command: #{inspect("#{codex_binary} app-server")}
+      hooks:
+        after_create: #{inspect("cp #{Path.join(template_repo, "README.md")} README.md")}
+      ---
+      Ticket {{ issue.identifier }}
+      """
+
+      File.write!(Workflow.workflow_file_path(), workflow)
+      assert :ok = WorkflowStore.force_reload()
+
+      issue = %Issue{
+        id: "issue-pending-render-failure",
+        identifier: "owner/repo#128",
+        title: "Prepare pending review",
+        description: "Work moves through active states",
+        state: "state:ready-for-dev",
+        url: "https://example.org/issues/128",
+        labels: ["project:orbit", "state:ready-for-dev"]
+      }
+
+      state_fetcher = fn [_issue_id] ->
+        send(self(), {
+          :active_state_guidance_refresh,
+          %Issue{
+            issue
+            | state: "state:needs-review",
+              labels: ["project:orbit", "state:needs-review"]
+          }
+        })
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-pending-render-failure",
+             identifier: "owner/repo#128",
+             title: "Prepare pending review",
+             state: "state:needs-review"
+           }
+         ]}
+      end
+
+      assert_raise RuntimeError, ~r/state_guidance_render_failed/, fn ->
+        AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      end
+
+      turn_starts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.count(&String.contains?(&1, "\"method\":\"turn/start\""))
+
+      assert turn_starts == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

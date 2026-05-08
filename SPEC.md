@@ -350,14 +350,20 @@ Fields:
 - `kind` (string)
   - REQUIRED for dispatch.
   - Current supported value: `linear`
+- `options` (object)
+  - Adapter-specific tracker configuration.
+  - For `tracker.kind == "linear"`, supports `endpoint`, `api_key`, `project_slug`, and `assignee`.
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
+  - Backward-compatible shortcut for `tracker.options.endpoint`.
 - `api_key` (string)
   - MAY be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
+  - Backward-compatible shortcut for `tracker.options.api_key`.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
+  - Backward-compatible shortcut for `tracker.options.project_slug`.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -479,6 +485,29 @@ Fallback prompt behavior:
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
+State prompt behavior:
+
+- `agent.state_prompts` MAY define prompt guidance keyed by tracker-native issue state.
+- State prompt keys match normalized issue states using trim and lowercase semantics.
+- State prompt keys MUST NOT be blank after trim, and values MUST be non-empty strings.
+- When a state prompt matches, append it to the workflow body prompt under a fixed state guidance
+  section heading.
+- State prompts use the same template input variables as the workflow body prompt.
+- The first turn uses the state prompt for the issue state observed at dispatch.
+- During a worker run, when reconciliation observes an issue moving from one active state to another
+  active state, the worker SHOULD send the new state's state prompt to the active Codex turn using
+  same-turn steering when that state has a matching state prompt.
+- Active-state guidance refreshes use the same template input variables as first-turn state prompts;
+  they do not add transition-specific variables such as previous state.
+- If the new active state has no matching state prompt, the worker SHOULD NOT send generic state
+  guidance to Codex.
+- If an active-state guidance refresh is not delivered because the current turn has already
+  completed before steering is attempted, the worker SHOULD append the latest refresh guidance to the
+  next continuation turn after the generic continuation guidance.
+- If same-turn steering or refresh state prompt rendering fails, the worker run SHOULD fail so the
+  orchestrator can retry with fresh state guidance instead of letting the agent continue under stale
+  guidance.
+
 ### 5.5 Workflow Validation and Error Surface
 
 Error classes:
@@ -562,6 +591,8 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
+- `agent.state_prompts` contains non-blank keys, non-empty string values, and no duplicate keys
+  after tracker state normalization.
 - `codex.command` is present and non-empty.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
@@ -570,10 +601,19 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`
-- `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
-- `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.kind`: string, REQUIRED, currently `linear` or `github`
+- `tracker.options`: map, adapter-specific configuration for the selected `tracker.kind`
+- `tracker.options.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
+- `tracker.options.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
+- `tracker.options.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.options.repository`: string, REQUIRED when `tracker.kind=github`
+- `tracker.options.scope`: map, REQUIRED when `tracker.kind=github`; supported values are
+  `type: label` with one `project:` label or `type: repository`
+- `tracker.options.endpoint`: string, default `https://api.github.com` when `tracker.kind=github`
+- `tracker.options.api_key`: string or `$VAR`, canonical env `GITHUB_TOKEN` when `tracker.kind=github`
+- `tracker.endpoint`: legacy shortcut for `tracker.options.endpoint`
+- `tracker.api_key`: legacy shortcut for `tracker.options.api_key`
+- `tracker.project_slug`: legacy shortcut for `tracker.options.project_slug`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -587,6 +627,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `agent.state_prompts`: map of tracker-native state values to state-selected prompt guidance, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -630,8 +671,10 @@ Important nuance:
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
+- Continuation turns SHOULD send continuation guidance to the existing thread, not resend the
+  original task prompt that is already present in thread history. If active-state guidance refresh
+  delivery was deferred because the previous turn had already completed, the next continuation turn
+  SHOULD append the latest rendered state guidance after the generic continuation guidance.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
@@ -794,6 +837,9 @@ Part B: Tracker state refresh
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
   - If tracker state is still active: update the in-memory issue snapshot.
+    - If the previous tracked state and refreshed state are both active states and differ after
+      normalization, notify the running worker of the refreshed issue so it can attempt active-state
+      guidance refresh delivery.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
@@ -953,6 +999,10 @@ client to:
 - Start the first turn with the rendered issue prompt.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
+- When a running issue changes from one active tracker state to another, steer the active turn with
+  the new state's rendered state guidance when the targeted protocol supports same-turn steering.
+  If the turn has already completed before steering is attempted, deliver the latest pending state
+  guidance with the next continuation turn.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
   targeted protocol.
 - Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
@@ -1130,19 +1180,25 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract
 
 ### 11.1 REQUIRED Operations
 
 An implementation MUST support these tracker adapter operations:
 
-1. `fetch_candidate_issues()`
+1. `capabilities()`
+   - Return adapter-declared operation support.
+
+2. `validate_settings(settings)`
+   - Validate adapter-specific tracker settings.
+
+3. `fetch_candidate_issues()`
    - Return issues in configured active states for a configured project.
 
-2. `fetch_issues_by_states(state_names)`
+4. `fetch_issues_by_states(state_names)`
    - Used for startup terminal cleanup.
 
-3. `fetch_issue_states_by_ids(issue_ids)`
+5. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
 ### 11.2 Query Semantics (Linear)
@@ -1152,7 +1208,7 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - `tracker.kind == "linear"`
 - GraphQL endpoint (default `https://api.linear.app/graphql`)
 - Auth token sent in `Authorization` header
-- `tracker.project_slug` maps to Linear project `slugId`
+- `tracker.options.project_slug` maps to Linear project `slugId`
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
 - Pagination REQUIRED for candidate issues
@@ -1167,7 +1223,26 @@ Important:
 A non-Linear implementation MAY change transport details, but the normalized outputs MUST match the
 domain model in Section 4.
 
-### 11.3 Normalization Rules
+### 11.3 Query Semantics (GitHub Label-State)
+
+GitHub-specific requirements for `tracker.kind == "github"`:
+
+- `tracker.options.repository` names one `owner/repo` repository.
+- `tracker.options.scope` is explicit. `type: label` uses one `project:` scope label; `type:
+  repository` intentionally inspects every issue in the repository.
+- Candidate polling reads open issues inside scope, validates each returned issue has exactly one
+  `state:` label, then filters by configured active states.
+- `state:` label matching is case-insensitive; normalized issue state stores the full lowercased
+  label value, for example `state:ready-for-dev`.
+- `fetch_issue_states_by_ids(issue_ids)` accepts normalized GitHub issue identities in
+  `owner/repo#number` form and validates the specific issues being reconciled.
+- `fetch_issues_by_states(state_names)` queries issues matching the requested `state:` labels inside
+  scope and does not audit every scoped issue.
+- `update_issue_state(issue_id, state_name)` requires `state_name` to include the full `state:`
+  prefix, replaces only the existing `state:` label, preserves scope and ordinary labels, and
+  synchronizes GitHub open/closed state from the configured terminal state set.
+
+### 11.4 Normalization Rules
 
 Candidate issue normalization SHOULD produce fields listed in Section 4.1.1.
 
@@ -1178,7 +1253,7 @@ Additional normalization details:
 - `priority` -> integer only (non-integers become null)
 - `created_at` and `updated_at` -> parse ISO-8601 timestamps
 
-### 11.4 Error Handling Contract
+### 11.5 Error Handling Contract
 
 RECOMMENDED error categories:
 
@@ -1190,6 +1265,10 @@ RECOMMENDED error categories:
 - `linear_graphql_errors`
 - `linear_unknown_payload`
 - `linear_missing_end_cursor` (pagination integrity error)
+- `github_api_request` (transport failures)
+- `github_api_status` (unexpected HTTP status)
+- `github_unknown_payload`
+- `invalid_label_state`
 
 Orchestrator behavior on tracker errors:
 
@@ -1197,7 +1276,7 @@ Orchestrator behavior on tracker errors:
 - Running-state refresh failure: log and keep active workers running.
 - Startup terminal cleanup failure: log warning and continue startup.
 
-### 11.5 Tracker Writes (Important Boundary)
+### 11.6 Tracker Writes (Important Boundary)
 
 Symphony does not require first-class tracker write APIs in the orchestrator.
 
@@ -1663,7 +1742,7 @@ Possible hardening measures include:
   of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
   separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
+- Filtering which issues, projects, teams, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
   intended project scope, rather than exposing general workspace-wide tracker access.
@@ -1756,6 +1835,9 @@ function reconcile_running_issues(state):
     if issue.state in terminal_states:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
     else if issue.state in active_states:
+      if state.running[issue.id].issue.state in active_states and
+         normalize(state.running[issue.id].issue.state) != normalize(issue.state):
+        send(state.running[issue.id].pid, active_state_guidance_refresh(issue))
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
@@ -1941,6 +2023,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
 - `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.options` preserves adapter-specific values and is populated from legacy Linear shortcut fields
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -2097,7 +2180,7 @@ Use the same validation profiles as Section 17:
   implementation details.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- TODO: Add tracker contract layers for richer issue body sections, review artifacts, and land gates.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 

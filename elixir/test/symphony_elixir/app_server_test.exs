@@ -183,6 +183,301 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server steers the active turn with text guidance" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-turn-steer-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1002")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-turn-steer.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-turn-steer.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1002"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace)
+      assert :ok = AppServer.steer_turn(session, "turn-1002", "Updated guidance")
+
+      trace = File.read!(trace_file)
+
+      assert trace =~ "\"method\":\"turn/steer\""
+      assert trace =~ "\"threadId\":\"thread-1002\""
+      assert trace =~ "\"expectedTurnId\":\"turn-1002\""
+      assert trace =~ "\"text\":\"Updated guidance\""
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server handles external messages while waiting for turn completion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-external-turn-message-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1003")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-external-turn-message.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-external-turn-message.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1003"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1003"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 200
+      )
+
+      issue = %Issue{
+        id: "issue-external-turn-message",
+        identifier: "MT-1003",
+        title: "Handle external turn message",
+        description: "Ensure active turns can be steered from worker messages",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1003",
+        labels: ["backend"]
+      }
+
+      parent = self()
+
+      assert {:ok, session} = AppServer.start_session(workspace)
+
+      on_message = fn
+        %{event: :session_started} ->
+          send(parent, {:steer_active_turn})
+
+        _message ->
+          :ok
+      end
+
+      on_external_message = fn
+        {:steer_active_turn}, turn_session ->
+          AppServer.steer_turn(turn_session, turn_session.turn_id, "External guidance")
+
+        _message, _turn_session ->
+          :unhandled
+      end
+
+      assert {:ok, _turn} =
+               AppServer.run_turn(session, "Start work", issue,
+                 on_message: on_message,
+                 on_external_message: on_external_message
+               )
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"turn/steer\""
+      assert trace =~ "\"text\":\"External guidance\""
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server preserves turn events that arrive while waiting for steer response" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-steer-preserves-events-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1004")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-steer-preserves-events.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-steer-preserves-events.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1004"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1004"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"id":4,"result":{}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 200
+      )
+
+      issue = %Issue{
+        id: "issue-steer-preserves-events",
+        identifier: "MT-1004",
+        title: "Preserve turn event during steer",
+        description: "Ensure turn completion is not dropped while waiting for steer response",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1004",
+        labels: ["backend"]
+      }
+
+      parent = self()
+
+      assert {:ok, session} = AppServer.start_session(workspace)
+
+      on_message = fn
+        %{event: :session_started} ->
+          send(parent, {:steer_active_turn})
+
+        _message ->
+          :ok
+      end
+
+      on_external_message = fn
+        {:steer_active_turn}, turn_session ->
+          AppServer.steer_turn(turn_session, turn_session.turn_id, "External guidance")
+
+        _message, _turn_session ->
+          :unhandled
+      end
+
+      assert {:ok, _turn} =
+               AppServer.run_turn(session, "Start work", issue,
+                 on_message: on_message,
+                 on_external_message: on_external_message
+               )
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"turn/steer\""
+      assert trace =~ "\"text\":\"External guidance\""
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(

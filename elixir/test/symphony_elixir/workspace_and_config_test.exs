@@ -917,6 +917,239 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.command == "#{codex_bin} app-server"
   end
 
+  test "config exposes adapter-specific tracker options while preserving legacy linear fields" do
+    api_key_env_var = "SYMP_LINEAR_OPTIONS_KEY_#{System.unique_integer([:positive])}"
+    assignee_env_var = "SYMP_LINEAR_OPTIONS_ASSIGNEE_#{System.unique_integer([:positive])}"
+
+    previous_api_key = System.get_env(api_key_env_var)
+    previous_assignee = System.get_env(assignee_env_var)
+
+    System.put_env(api_key_env_var, "resolved-linear-token")
+    System.put_env(assignee_env_var, "resolved-assignee")
+
+    on_exit(fn ->
+      restore_env(api_key_env_var, previous_api_key)
+      restore_env(assignee_env_var, previous_assignee)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_endpoint: "https://linear.example/graphql",
+      tracker_api_token: "$#{api_key_env_var}",
+      tracker_project_slug: "project-slug",
+      tracker_assignee: "$#{assignee_env_var}"
+    )
+
+    config = Config.settings!()
+
+    assert config.tracker.endpoint == "https://linear.example/graphql"
+    assert config.tracker.api_key == "resolved-linear-token"
+    assert config.tracker.project_slug == "project-slug"
+    assert config.tracker.assignee == "resolved-assignee"
+
+    assert config.tracker.options == %{
+             "endpoint" => "https://linear.example/graphql",
+             "api_key" => "resolved-linear-token",
+             "project_slug" => "project-slug",
+             "assignee" => "resolved-assignee"
+           }
+
+    assert :ok = Config.validate!()
+  end
+
+  test "linear tracker can be configured through tracker options without legacy fields" do
+    workflow = """
+    ---
+    tracker:
+      kind: linear
+      active_states: ["Todo"]
+      terminal_states: ["Done"]
+      options:
+        endpoint: "https://linear.example/graphql"
+        api_key: "options-linear-token"
+        project_slug: "options-project"
+        assignee: "options-assignee"
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    config = Config.settings!()
+
+    assert config.tracker.options == %{
+             "endpoint" => "https://linear.example/graphql",
+             "api_key" => "options-linear-token",
+             "project_slug" => "options-project",
+             "assignee" => "options-assignee"
+           }
+
+    assert config.tracker.endpoint == "https://linear.example/graphql"
+    assert config.tracker.api_key == "options-linear-token"
+    assert config.tracker.project_slug == "options-project"
+    assert config.tracker.assignee == "options-assignee"
+    assert :ok = Config.validate!()
+  end
+
+  test "github tracker can be configured through tracker options with github token default" do
+    previous_github_token = System.get_env("GITHUB_TOKEN")
+
+    System.put_env("GITHUB_TOKEN", "resolved-github-token")
+
+    on_exit(fn -> restore_env("GITHUB_TOKEN", previous_github_token) end)
+
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      active_states: ["state:ready-for-dev"]
+      terminal_states: ["state:merged"]
+      options:
+        repository: "owner/repo"
+        scope:
+          type: label
+          label: "project:orbit"
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    config = Config.settings!()
+
+    assert config.tracker.endpoint == "https://api.github.com"
+    assert config.tracker.api_key == "resolved-github-token"
+
+    assert config.tracker.options == %{
+             "endpoint" => "https://api.github.com",
+             "api_key" => "resolved-github-token",
+             "repository" => "owner/repo",
+             "scope" => %{"type" => "label", "label" => "project:orbit"}
+           }
+
+    assert :ok = Config.validate!()
+  end
+
+  test "github tracker preserves a legacy non-default endpoint as an option" do
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      endpoint: "https://github.example/api"
+      active_states: ["state:ready-for-dev"]
+      terminal_states: ["state:merged"]
+      options:
+        api_key: "github-token"
+        repository: "owner/repo"
+        scope:
+          type: repository
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    config = Config.settings!()
+    assert config.tracker.options["endpoint"] == "https://github.example/api"
+  end
+
+  test "github tracker requires full label state values in state sets" do
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      active_states: ["ready-for-dev"]
+      terminal_states: ["state:merged"]
+      options:
+        repository: "owner/repo"
+        api_key: "github-token"
+        scope:
+          type: label
+          label: "project:orbit"
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:invalid_github_state_set, :active_states, "ready-for-dev"}} = Config.validate!()
+  end
+
+  test "config rejects duplicate state prompt keys after state normalization" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        Todo: |
+          Start work.
+        " todo ": |
+          Duplicate after normalization.
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:duplicate_state_prompt, "todo"}} = Config.validate!()
+  end
+
+  test "config rejects invalid state prompt entries" do
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        " ": |
+          Blank state key.
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, :blank_state_prompt_key} = Config.validate!()
+
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        todo: 123
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:invalid_state_prompt, "todo", :not_a_string}} = Config.validate!()
+
+    workflow = """
+    ---
+    tracker:
+      kind: memory
+    agent:
+      state_prompts:
+        todo: " "
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert {:error, {:invalid_state_prompt, "todo", :blank}} = Config.validate!()
+  end
+
   test "config no longer resolves legacy env: references" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

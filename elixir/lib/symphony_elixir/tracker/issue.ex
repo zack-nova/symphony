@@ -1,6 +1,6 @@
-defmodule SymphonyElixir.Linear.Issue do
+defmodule SymphonyElixir.Tracker.Issue do
   @moduledoc """
-  Normalized Linear issue representation used by the orchestrator.
+  Normalized tracker issue representation used by the orchestrator.
   """
 
   defstruct [

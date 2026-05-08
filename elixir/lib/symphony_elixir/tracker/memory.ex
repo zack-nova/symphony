@@ -5,7 +5,20 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Tracker.Issue
+
+  @spec capabilities() :: map()
+  def capabilities do
+    %{
+      comments: true,
+      state_updates: true,
+      issue_sections: false,
+      review_artifacts: false
+    }
+  end
+
+  @spec validate_settings(term()) :: :ok
+  def validate_settings(_settings), do: :ok
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do

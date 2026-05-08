@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work
+1. Polls the configured issue tracker for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -30,8 +30,11 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
+2. Configure tracker auth:
+   - For Linear, get a personal token via Settings → Security & access → Personal API keys, and
+     set it as the `LINEAR_API_KEY` environment variable.
+   - For GitHub, set `GITHUB_TOKEN` to a token that can read issues, write issue labels, close/open
+     issues, and create issue comments in the configured repository.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
@@ -89,7 +92,8 @@ Minimal example:
 ---
 tracker:
   kind: linear
-  project_slug: "..."
+  options:
+    project_slug: "..."
 workspace:
   root: ~/code/workspaces
 hooks:
@@ -102,9 +106,42 @@ codex:
   command: codex app-server
 ---
 
-You are working on a Linear issue {{ issue.identifier }}.
+You are working on a tracker issue {{ issue.identifier }}.
 
 Title: {{ issue.title }} Body: {{ issue.description }}
+```
+
+GitHub label-state tracker example:
+
+```yaml
+tracker:
+  kind: github
+  active_states:
+    - state:ready-for-dev
+    - state:in-progress
+    - state:to-rework
+    - state:to-merge
+  terminal_states:
+    - state:merged
+  options:
+    repository: owner/repo
+    api_key: $GITHUB_TOKEN
+    scope:
+      type: label
+      label: project:orbit
+    assignee: me
+```
+
+Use an explicit repository-wide scope only when Symphony should inspect every issue in the repo:
+
+```yaml
+tracker:
+  kind: github
+  options:
+    repository: owner/repo
+    api_key: $GITHUB_TOKEN
+    scope:
+      type: repository
 ```
 
 Notes:
@@ -121,13 +158,26 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.state_prompts` maps complete tracker-native state values to first-turn guidance appended
+  after the workflow body prompt. Keys are matched using trim/lowercase normalization, and duplicate
+  normalized keys are rejected during validation. Values must be non-empty strings.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
-- `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- Adapter-specific settings live under `tracker.options`. The legacy Linear fields
+  `tracker.endpoint`, `tracker.api_key`, `tracker.project_slug`, and `tracker.assignee` are still
+  accepted and are normalized into `tracker.options`.
+- `tracker.options.api_key` reads from `LINEAR_API_KEY` when unset or when value is
+  `$LINEAR_API_KEY`.
+- When `tracker.kind` is `github`, `tracker.options.api_key` reads from `GITHUB_TOKEN` when unset
+  or when value is `$GITHUB_TOKEN`.
+- GitHub label-state tracking requires an explicit `tracker.options.scope`. Use `type: label` with
+  one `project:` label, or `type: repository` to intentionally inspect every issue in the repo.
+- GitHub issues inside scope must have exactly one `state:` label. Symphony keeps the full label
+  value, such as `state:ready-for-dev`, as the normalized issue state.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -135,7 +185,14 @@ Notes:
 
 ```yaml
 tracker:
-  api_key: $LINEAR_API_KEY
+  options:
+    api_key: $LINEAR_API_KEY
+agent:
+  state_prompts:
+    state:ready-for-dev: |
+      Start fresh development work from the issue details.
+    state:to-rework: |
+      Address review feedback and preserve existing progress.
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:

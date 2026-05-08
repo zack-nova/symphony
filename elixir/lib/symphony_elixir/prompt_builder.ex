@@ -1,17 +1,18 @@
 defmodule SymphonyElixir.PromptBuilder do
   @moduledoc """
-  Builds agent prompts from Linear issue data.
+  Builds agent prompts from normalized tracker issue data.
   """
 
   alias SymphonyElixir.{Config, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
-  @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
+  @spec build_prompt(SymphonyElixir.Tracker.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
     template =
       Workflow.current()
       |> prompt_template!()
+      |> append_state_prompt(issue)
       |> parse_template!()
 
     template
@@ -23,6 +24,35 @@ defmodule SymphonyElixir.PromptBuilder do
       @render_opts
     )
     |> IO.iodata_to_binary()
+  end
+
+  @spec build_state_guidance(SymphonyElixir.Tracker.Issue.t(), keyword()) :: String.t() | nil
+  def build_state_guidance(issue, opts \\ []) do
+    case state_prompt_for(issue) do
+      prompt_variant when is_binary(prompt_variant) ->
+        rendered_prompt =
+          prompt_variant
+          |> parse_template!()
+          |> Solid.render!(
+            %{
+              "attempt" => Keyword.get(opts, :attempt),
+              "issue" => issue |> Map.from_struct() |> to_solid_map()
+            },
+            @render_opts
+          )
+          |> IO.iodata_to_binary()
+          |> String.trim_trailing()
+
+        """
+        #{Keyword.get(opts, :heading, "State guidance for")} #{issue.state}:
+
+        #{rendered_prompt}
+        """
+        |> String.trim_trailing()
+
+      nil ->
+        nil
+    end
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
@@ -61,4 +91,57 @@ defmodule SymphonyElixir.PromptBuilder do
       prompt
     end
   end
+
+  defp append_state_prompt(prompt, issue) when is_binary(prompt) do
+    case state_prompt_for(issue) do
+      prompt_variant when is_binary(prompt_variant) ->
+        """
+        #{String.trim_trailing(prompt)}
+
+        State guidance for #{issue.state}:
+
+        #{prompt_variant}
+        """
+        |> String.trim_trailing()
+
+      nil ->
+        prompt
+    end
+  end
+
+  defp state_prompt_for(%{state: state}) when is_binary(state) do
+    state_prompts()
+    |> Map.get(normalize_state_key(state))
+    |> normalize_state_prompt()
+  end
+
+  defp state_prompt_for(_issue), do: nil
+
+  defp state_prompts do
+    case Config.settings() do
+      {:ok, settings} ->
+        settings.agent.state_prompts
+        |> normalize_state_prompt_keys()
+
+      {:error, _reason} ->
+        %{}
+    end
+  end
+
+  defp normalize_state_prompt_keys(prompts) when is_map(prompts) do
+    Map.new(prompts, fn {state, prompt} -> {normalize_state_key(state), prompt} end)
+  end
+
+  defp normalize_state_key(state) do
+    state
+    |> to_string()
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_state_prompt(prompt) when is_binary(prompt) do
+    if String.trim(prompt) == "", do: nil, else: prompt
+  end
+
+  defp normalize_state_prompt(_prompt), do: nil
 end
