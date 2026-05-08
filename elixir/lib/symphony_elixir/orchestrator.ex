@@ -125,40 +125,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       issue_id ->
-        {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
-        session_id = running_entry_session_id(running_entry)
-
-        state =
-          case reason do
-            :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-
-            _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-              delay_type = if state_guidance_refresh_failure?(reason), do: :state_guidance_refresh, else: nil
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                delay_type: delay_type,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-          end
-
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+        state = finish_agent_task(state, issue_id, reason)
 
         notify_dashboard()
         {:noreply, state}
@@ -221,6 +188,54 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp finish_agent_task(state, issue_id, reason) do
+    {running_entry, state} = pop_running_entry(state, issue_id)
+    state = record_session_completion_totals(state, running_entry)
+    session_id = running_entry_session_id(running_entry)
+    state = schedule_finished_agent_retry(state, issue_id, session_id, running_entry, reason)
+
+    Logger.info(
+      "Agent task finished for issue_id=#{issue_id} " <>
+        "session_id=#{session_id} reason=#{inspect(reason)}"
+    )
+
+    state
+  end
+
+  defp schedule_finished_agent_retry(state, issue_id, session_id, running_entry, :normal) do
+    Logger.info(
+      "Agent task completed for issue_id=#{issue_id} " <>
+        "session_id=#{session_id}; scheduling active-state continuation check"
+    )
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      delay_type: :continuation,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
+  defp schedule_finished_agent_retry(state, issue_id, session_id, running_entry, reason) do
+    Logger.warning(
+      "Agent task exited for issue_id=#{issue_id} " <>
+        "session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry"
+    )
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+    delay_type = if state_guidance_refresh_failure?(reason), do: :state_guidance_refresh, else: nil
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: running_entry.identifier,
+      error: "agent exited: #{inspect(reason)}",
+      delay_type: delay_type,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
   end
 
   defp maybe_dispatch(%State{} = state) do

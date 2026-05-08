@@ -107,7 +107,17 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, on_external_message, turn_session) do
+        turn_result =
+          await_turn_completion(
+            port,
+            on_message,
+            tool_executor,
+            auto_approve_requests,
+            on_external_message,
+            turn_session
+          )
+
+        case turn_result do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -354,48 +364,47 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, on_external_message, turn_session) do
-    receive_loop(
-      port,
-      on_message,
-      Config.settings!().codex.turn_timeout_ms,
-      "",
-      tool_executor,
-      auto_approve_requests,
-      on_external_message,
-      turn_session,
-      []
-    )
+    receive_loop(%{
+      port: port,
+      on_message: on_message,
+      timeout_ms: Config.settings!().codex.turn_timeout_ms,
+      pending_line: "",
+      tool_executor: tool_executor,
+      auto_approve_requests: auto_approve_requests,
+      on_external_message: on_external_message,
+      turn_session: turn_session,
+      deferred_messages: []
+    })
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages) do
+  defp receive_loop(
+         %{
+           port: port,
+           timeout_ms: timeout_ms,
+           pending_line: pending_line,
+           on_external_message: on_external_message,
+           turn_session: turn_session,
+           deferred_messages: deferred_messages
+         } = loop_state
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+        handle_incoming(%{loop_state | pending_line: complete_line})
 
       {^port, {:data, {:noeol, chunk}}} ->
-        receive_loop(
-          port,
-          on_message,
-          timeout_ms,
-          pending_line <> to_string(chunk),
-          tool_executor,
-          auto_approve_requests,
-          on_external_message,
-          turn_session,
-          deferred_messages
-        )
+        receive_loop(%{loop_state | pending_line: pending_line <> to_string(chunk)})
 
       {^port, {:exit_status, status}} ->
-        handle_port_exit(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages, status)
+        handle_port_exit(loop_state, status)
 
       message when is_function(on_external_message, 2) ->
         case on_external_message.(message, turn_session) do
           result when result in [:ok, :handled] ->
-            receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+            receive_loop(loop_state)
 
           :unhandled ->
-            receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, [message | deferred_messages])
+            receive_loop(%{loop_state | deferred_messages: [message | deferred_messages]})
 
           {:error, reason} ->
             return_with_deferred_messages({:error, reason}, deferred_messages)
@@ -409,8 +418,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages) do
-    payload_string = to_string(data)
+  defp handle_incoming(
+         %{
+           port: port,
+           on_message: on_message,
+           pending_line: pending_line,
+           deferred_messages: deferred_messages
+         } = loop_state
+       ) do
+    payload_string = to_string(pending_line)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
@@ -443,19 +459,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
-        handle_turn_method(
-          port,
-          on_message,
-          payload,
-          payload_string,
-          method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests,
-          on_external_message,
-          turn_session,
-          deferred_messages
-        )
+        handle_turn_method(loop_state, payload, payload_string, method)
 
       {:ok, payload} ->
         emit_message(
@@ -468,7 +472,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+        continue_receive_loop(loop_state)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -485,9 +489,11 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+        continue_receive_loop(loop_state)
     end
   end
+
+  defp continue_receive_loop(loop_state), do: receive_loop(%{loop_state | pending_line: ""})
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
     emit_message(
@@ -510,20 +516,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     result
   end
 
-  defp handle_port_exit(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages, status) do
+  defp handle_port_exit(%{port: port, pending_line: pending_line, deferred_messages: deferred_messages} = loop_state, status) do
     case take_deferred_terminal_turn_line(port) do
       {:ok, line} ->
-        handle_incoming(
-          port,
-          on_message,
-          pending_line <> line,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests,
-          on_external_message,
-          turn_session,
-          deferred_messages
-        )
+        handle_incoming(%{loop_state | pending_line: pending_line <> line})
 
       :none ->
         return_with_deferred_messages({:error, {:port_exit, status}}, deferred_messages)
@@ -554,17 +550,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp handle_turn_method(
-         port,
-         on_message,
+         %{
+           port: port,
+           on_message: on_message,
+           tool_executor: tool_executor,
+           auto_approve_requests: auto_approve_requests,
+           deferred_messages: deferred_messages
+         } = loop_state,
          payload,
          payload_string,
-         method,
-         timeout_ms,
-         tool_executor,
-         auto_approve_requests,
-         on_external_message,
-         turn_session,
-         deferred_messages
+         method
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -589,7 +584,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         return_with_deferred_messages({:error, {:turn_input_required, payload}}, deferred_messages)
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+        continue_receive_loop(loop_state)
 
       :approval_required ->
         emit_message(
@@ -623,7 +618,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, on_external_message, turn_session, deferred_messages)
+          continue_receive_loop(loop_state)
         end
     end
   end
@@ -1036,7 +1031,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         handle_response(port, request_id, complete_line, timeout_ms, deferred_messages, preserve_unmatched)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk), deferred_messages, preserve_unmatched)
+        with_timeout_response(
+          port,
+          request_id,
+          timeout_ms,
+          pending_line <> to_string(chunk),
+          deferred_messages,
+          preserve_unmatched
+        )
 
       {^port, {:exit_status, status}} ->
         return_with_deferred_messages({:error, {:port_exit, status}}, deferred_messages)

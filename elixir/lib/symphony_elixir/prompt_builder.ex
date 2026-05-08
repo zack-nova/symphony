@@ -132,8 +132,6 @@ defmodule SymphonyElixir.PromptBuilder do
     Map.new(prompts, fn {state, prompt} -> {normalize_state_key(state), prompt} end)
   end
 
-  defp normalize_state_prompt_keys(_prompts), do: %{}
-
   defp normalize_state_key(state) do
     state
     |> to_string()

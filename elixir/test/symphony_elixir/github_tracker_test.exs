@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.GitHubTrackerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
+
   setup do
     github_request_fun = Application.get_env(:symphony_elixir, :github_request_fun)
 
@@ -76,6 +78,68 @@ defmodule SymphonyElixir.GitHubTrackerTest do
 
     assert_receive {:github_request, :get, "/repos/owner/repo/issues", opts}
     assert opts[:params] == %{labels: "project:orbit", page: 1, per_page: 100, state: "open"}
+  end
+
+  test "validates GitHub tracker settings shape" do
+    base_settings = %{
+      api_key: "github-token",
+      options: %{
+        "repository" => "owner/repo",
+        "scope" => %{"type" => "label", "label" => "project:orbit"}
+      },
+      active_states: ["state:ready-for-dev"],
+      terminal_states: ["state:merged"]
+    }
+
+    assert :ok = GitHubAdapter.validate_settings(base_settings)
+
+    assert :ok =
+             GitHubAdapter.validate_settings(%{
+               base_settings
+               | options: %{"repository" => "owner/repo", "scope" => %{"type" => "repository"}}
+             })
+
+    assert {:error, :missing_github_api_token} =
+             GitHubAdapter.validate_settings(%{base_settings | api_key: nil})
+
+    assert {:error, :missing_github_repository} =
+             GitHubAdapter.validate_settings(%{
+               base_settings
+               | options: %{"scope" => %{"type" => "repository"}}
+             })
+
+    assert {:error, :missing_github_repository} =
+             GitHubAdapter.validate_settings(%{
+               base_settings
+               | options: %{"repository" => "owner", "scope" => %{"type" => "repository"}}
+             })
+
+    assert {:error, :missing_github_tracker_scope} =
+             GitHubAdapter.validate_settings(%{
+               base_settings
+               | options: %{"repository" => "owner/repo"}
+             })
+
+    assert {:error, :invalid_github_tracker_scope} =
+             GitHubAdapter.validate_settings(%{
+               base_settings
+               | options: %{"repository" => "owner/repo", "scope" => %{"type" => "milestone"}}
+             })
+
+    assert {:error, :invalid_github_scope_label} =
+             GitHubAdapter.validate_settings(%{
+               base_settings
+               | options: %{
+                   "repository" => "owner/repo",
+                   "scope" => %{"type" => "label", "label" => "type:bug"}
+                 }
+             })
+
+    assert {:error, {:invalid_github_state_set, :active_states, nil}} =
+             GitHubAdapter.validate_settings(%{base_settings | active_states: nil})
+
+    assert {:error, {:invalid_github_state_set, :active_states, 123}} =
+             GitHubAdapter.validate_settings(%{base_settings | active_states: [123]})
   end
 
   test "resolves assignee me before fetching candidate GitHub issues" do

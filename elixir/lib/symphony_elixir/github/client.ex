@@ -469,8 +469,6 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.any?(&(normalize_assignee(&1) == normalized_login))
   end
 
-  defp assigned_to_worker?(_issue, _assignee_filter), do: false
-
   defp assignee_logins(%{"assignees" => assignees}) when is_list(assignees) do
     assignees
     |> Enum.map(fn

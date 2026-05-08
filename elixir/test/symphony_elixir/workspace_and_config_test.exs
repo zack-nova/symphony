@@ -1031,6 +1031,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert :ok = Config.validate!()
   end
 
+  test "github tracker preserves a legacy non-default endpoint as an option" do
+    workflow = """
+    ---
+    tracker:
+      kind: github
+      endpoint: "https://github.example/api"
+      active_states: ["state:ready-for-dev"]
+      terminal_states: ["state:merged"]
+      options:
+        api_key: "github-token"
+        repository: "owner/repo"
+        scope:
+          type: repository
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    config = Config.settings!()
+    assert config.tracker.options["endpoint"] == "https://github.example/api"
+  end
+
   test "github tracker requires full label state values in state sets" do
     workflow = """
     ---

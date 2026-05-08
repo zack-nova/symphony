@@ -884,6 +884,16 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, []} = Client.fetch_issues_by_states([])
   end
 
+  test "tracker reports missing or invalid adapter kind" do
+    assert {:error, :missing_tracker_kind} = Tracker.adapter_for_kind(nil)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "unknown")
+
+    assert_raise ArgumentError, ~r/Invalid tracker adapter/, fn ->
+      Tracker.capabilities()
+    end
+  end
+
   test "prompt builder renders issue and attempt values from workflow template" do
     workflow_prompt =
       "Ticket {{ issue.identifier }} {{ issue.title }} labels={{ issue.labels }} attempt={{ attempt }}"
@@ -1020,6 +1030,35 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert PromptBuilder.build_prompt(issue) == "Ticket owner/repo#124"
+  end
+
+  test "prompt builder returns no state guidance without a matching prompt" do
+    issue = %Issue{
+      identifier: "owner/repo#124",
+      title: "Start new work",
+      state: "state:ready-for-dev",
+      labels: []
+    }
+
+    assert is_nil(PromptBuilder.build_state_guidance(issue))
+    assert is_nil(PromptBuilder.build_state_guidance(%{}))
+
+    missing_workflow = Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md")
+    Workflow.set_workflow_file_path(missing_workflow)
+
+    assert is_nil(PromptBuilder.build_state_guidance(issue))
+
+    invalid_config_workflow = """
+    ---
+    agent: invalid
+    ---
+    Ticket {{ issue.identifier }}
+    """
+
+    File.write!(Workflow.workflow_file_path(), invalid_config_workflow)
+    assert :ok = WorkflowStore.force_reload()
+
+    assert is_nil(PromptBuilder.build_state_guidance(issue))
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
